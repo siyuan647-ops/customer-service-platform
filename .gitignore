@@ -1,0 +1,14 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.log
+artifacts/
+dist/
+build/
+*.egg-info/
+.next/
+node_modules/
+coverage/
+.coverage

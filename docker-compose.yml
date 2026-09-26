@@ -1,0 +1,101 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: customer_service
+      POSTGRES_USER: customer_service
+      POSTGRES_PASSWORD: customer_service
+    ports: ["${POSTGRES_HOST_PORT:-15432}:5432"]
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U customer_service -d customer_service"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["${REDIS_HOST_PORT:-16379}:6379"]
+    volumes: ["redis_data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    # The upstream community image was withdrawn in September 2026. This
+    # pinned Bitnami legacy build is for local development only.
+    image: bitnamilegacy/minio:2025.7.23-debian-12-r5
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+      MINIO_BROWSER: "on"
+      MINIO_DEFAULT_BUCKETS: customer-service
+    ports: ["9000:9000", "9001:9001"]
+    volumes: ["minio_data:/bitnami/minio/data"]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://customer_service:customer_service@postgres:5432/customer_service
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      EVENT_BACKEND: redis
+      AUTO_CREATE_SCHEMA: "false"
+      API_CORS_ORIGINS: '["http://localhost:3000","http://127.0.0.1:3000"]'
+      HF_HOME: /root/.cache/huggingface
+    command: >-
+      sh -c "alembic upgrade head &&
+      uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --no-access-log"
+    ports: ["8000:8000"]
+    volumes: ["huggingface_cache:/root/.cache/huggingface"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 5s
+      timeout: 4s
+      retries: 30
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      minio: {condition: service_healthy}
+
+  after-sales-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://customer_service:customer_service@postgres:5432/customer_service
+      ORDER_BACKEND: postgres
+      MINIO_ENDPOINT: minio:9000
+      AFTER_SALES_WORKER_POLL_SECONDS: "1"
+    command: ["python", "-m", "backend.app.workers.after_sales"]
+    depends_on:
+      backend: {condition: service_healthy}
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    environment:
+      BACKEND_INTERNAL_URL: http://backend:8000
+      HOSTNAME: 0.0.0.0
+      PORT: "3000"
+    ports: ["3000:3000"]
+    depends_on: [backend]
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  huggingface_cache:

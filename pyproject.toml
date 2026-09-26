@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "customer-service-platform"
+version = "0.4.0"
+description = "Multi-agent ecommerce customer service platform"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "alembic>=1.14",
+  "asyncpg>=0.30",
+  "fastapi>=0.115",
+  "httpx>=0.28",
+  "minio>=7.2",
+  "openai>=1.66",
+  "openai-agents",
+  "pgvector>=0.4,<0.6",
+  "pydantic-settings>=2.7",
+  "python-multipart>=0.0.20",
+  "python-dotenv>=1.0",
+  "redis>=5.2",
+  "sentence-transformers>=5.1,<6",
+  "sqlalchemy[asyncio]>=2.0.36",
+  "sse-starlette>=2.2",
+  "structlog>=24.4",
+  "uvicorn[standard]>=0.34",
+]
+
+[project.optional-dependencies]
+dev = [
+  "aiosqlite>=0.20",
+  "pytest>=8.0",
+  "pytest-asyncio>=0.24",
+]
+
+[project.scripts]
+kimi-agent-spike = "kimi_agent_spike.cli:main"
+knowledge-import = "backend.app.knowledge.cli:main"
+order-seed = "backend.app.orders.seed:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kimi_agent_spike", "backend"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
