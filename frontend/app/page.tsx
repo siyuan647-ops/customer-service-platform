@@ -118,7 +118,9 @@ export default function Home() {
       const data = JSON.parse((raw as MessageEvent).data);
       setMessages((current) =>
         current.some((item) => item.id === data.run_id)
-          ? current
+          ? current.map((item) =>
+              item.id === data.run_id ? { ...item, content: "" } : item,
+            )
           : [...current, { id: data.run_id, role: "assistant", content: "" }],
       );
     });

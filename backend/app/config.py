@@ -23,6 +23,16 @@ class Settings(BaseSettings):
     )
     redis_url: str = "redis://localhost:6379/0"
     event_backend: Literal["redis", "memory"] = "redis"
+    agent_task_backend: Literal["inline", "rabbitmq"] = "inline"
+    rabbitmq_url: str = "amqp://customer_service:customer_service@localhost:5672/"
+    rabbitmq_exchange: str = "customer_service.commands"
+    rabbitmq_agent_queue: str = "agent.reply.q"
+    rabbitmq_prefetch_count: int = Field(default=2, ge=1)
+    rabbitmq_publish_poll_seconds: float = Field(default=0.5, gt=0)
+    rabbitmq_publish_max_attempts: int = Field(default=10, ge=1)
+    rabbitmq_publish_lock_timeout_seconds: int = Field(default=60, ge=10)
+    rabbitmq_consumer_max_attempts: int = Field(default=4, ge=1)
+    rabbitmq_conversation_lock_ttl_seconds: int = Field(default=180, ge=30)
     minio_enabled: bool = True
     minio_endpoint: str = "localhost:9000"
     minio_access_key: str = "minioadmin"

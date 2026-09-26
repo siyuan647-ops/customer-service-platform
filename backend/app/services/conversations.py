@@ -24,36 +24,44 @@ async def process_assistant_reply(
     broker: EventBroker,
     memory: ConversationMemory,
     responder: SupervisorAgent,
-    conversation_id: uuid.UUID,
-    customer_id: uuid.UUID,
-    input_message_id: uuid.UUID,
-    prompt: str,
-) -> None:
-    run_uuid = uuid.uuid4()
-    run_id = str(run_uuid)
+    run_id: uuid.UUID,
+    final_attempt: bool,
+) -> str:
+    run_uuid = run_id
+    run_id_text = str(run_uuid)
     async with database.session_factory() as session:
-        session.add(
-            AgentRun(
-                id=run_uuid,
-                conversation_id=conversation_id,
-                input_message_id=input_message_id,
-                status="running",
-                model=(
-                    responder.settings.kimi_model
-                    if responder.settings.agent_mode == "live"
-                    else "mock"
-                ),
-                trace=[],
-            )
-        )
+        agent_run = await session.get(AgentRun, run_uuid, with_for_update=True)
+        if agent_run is None:
+            raise RuntimeError("AgentRun does not exist")
+        if agent_run.status == "completed" and agent_run.output_message_id is not None:
+            return "already_completed"
+        if agent_run.status == "failed":
+            return "already_failed"
+        conversation = await session.get(Conversation, agent_run.conversation_id)
+        input_message = await session.get(Message, agent_run.input_message_id)
+        if conversation is None or input_message is None or conversation.customer_id is None:
+            raise RuntimeError("AgentRun references incomplete conversation data")
+        conversation_id = conversation.id
+        customer_id = conversation.customer_id
+        input_message_id = input_message.id
+        prompt = input_message.content
+        agent_run.status = "running"
+        agent_run.error_type = None
         await session.commit()
-    await broker.publish(str(conversation_id), "assistant.started", {"run_id": run_id})
-    chunks: list[str] = []
+
+    await _safe_publish(
+        broker,
+        str(conversation_id),
+        "assistant.started",
+        {"run_id": run_id_text},
+    )
     try:
         async def publish_delta(chunk: str) -> None:
-            chunks.append(chunk)
-            await broker.publish(
-                str(conversation_id), "assistant.delta", {"run_id": run_id, "delta": chunk}
+            await _safe_publish(
+                broker,
+                str(conversation_id),
+                "assistant.delta",
+                {"run_id": run_id_text, "delta": chunk},
             )
 
         try:
@@ -149,31 +157,56 @@ async def process_assistant_reply(
                 role="assistant",
             )
 
-        await broker.publish(
+        await _safe_publish(
+            broker,
             str(conversation_id),
             "assistant.completed",
-            {"run_id": run_id, "message_id": str(message.id), "content": content},
+            {"run_id": run_id_text, "message_id": str(message.id), "content": content},
         )
+        return "completed"
     except Exception as exc:
         logger.exception(
-            "assistant_reply_failed", conversation_id=str(conversation_id), run_id=run_id
+            "assistant_reply_failed",
+            conversation_id=str(conversation_id),
+            run_id=run_id_text,
+            final_attempt=final_attempt,
         )
         async with database.session_factory() as session:
-            agent_run = await session.get(AgentRun, run_uuid)
+            agent_run = await session.get(AgentRun, run_uuid, with_for_update=True)
             conversation = await session.get(Conversation, conversation_id)
             if agent_run:
-                agent_run.status = "failed"
+                agent_run.status = "failed" if final_attempt else "retrying"
                 agent_run.error_type = type(exc).__name__
                 agent_run.tool_call_count = getattr(exc, "tool_call_count", 0)
                 agent_run.trace = getattr(exc, "safe_trace", [])
-                agent_run.completed_at = datetime.now(UTC)
+                agent_run.completed_at = datetime.now(UTC) if final_attempt else None
             if conversation:
-                conversation.status = "active"
+                conversation.status = "active" if final_attempt else "processing"
             await session.commit()
-        await broker.publish(
-            str(conversation_id),
-            "assistant.failed",
-            {"run_id": run_id, "error": type(exc).__name__},
+        if final_attempt:
+            await _safe_publish(
+                broker,
+                str(conversation_id),
+                "assistant.failed",
+                {"run_id": run_id_text, "error": type(exc).__name__},
+            )
+            return "failed"
+        raise
+
+
+async def _safe_publish(
+    broker: EventBroker,
+    conversation_id: str,
+    event: str,
+    data: dict,
+) -> None:
+    try:
+        await broker.publish(conversation_id, event, data)
+    except Exception:
+        logger.exception(
+            "conversation_event_publish_failed",
+            conversation_id=conversation_id,
+            event=event,
         )
 
 

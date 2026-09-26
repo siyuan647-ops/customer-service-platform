@@ -24,6 +24,22 @@ services:
       timeout: 3s
       retries: 20
 
+  rabbitmq:
+    image: rabbitmq:4.1-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-customer_service}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-customer_service}
+    ports:
+      - "${RABBITMQ_HOST_PORT:-5672}:5672"
+      - "${RABBITMQ_MANAGEMENT_HOST_PORT:-15672}:15672"
+    volumes: ["rabbitmq_data:/var/lib/rabbitmq"]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
   minio:
     # The upstream community image was withdrawn in September 2026. This
     # pinned Bitnami legacy build is for local development only.
@@ -51,6 +67,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       MINIO_ENDPOINT: minio:9000
       EVENT_BACKEND: redis
+      AGENT_TASK_BACKEND: rabbitmq
       AUTO_CREATE_SCHEMA: "false"
       API_CORS_ORIGINS: '["http://localhost:3000","http://127.0.0.1:3000"]'
       HF_HOME: /root/.cache/huggingface
@@ -68,6 +85,42 @@ services:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
       minio: {condition: service_healthy}
+
+  outbox-relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://customer_service:customer_service@postgres:5432/customer_service
+      REDIS_URL: redis://redis:6379/0
+      EVENT_BACKEND: redis
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-customer_service}:${RABBITMQ_PASSWORD:-customer_service}@rabbitmq:5672/
+    command: ["python", "-m", "backend.app.workers.outbox_relay"]
+    depends_on:
+      backend: {condition: service_healthy}
+      rabbitmq: {condition: service_healthy}
+    restart: unless-stopped
+
+  agent-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://customer_service:customer_service@postgres:5432/customer_service
+      REDIS_URL: redis://redis:6379/0
+      EVENT_BACKEND: redis
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-customer_service}:${RABBITMQ_PASSWORD:-customer_service}@rabbitmq:5672/
+      ORDER_BACKEND: postgres
+      MINIO_ENDPOINT: minio:9000
+      HF_HOME: /root/.cache/huggingface
+    command: ["python", "-m", "backend.app.workers.agent_reply"]
+    volumes: ["huggingface_cache:/root/.cache/huggingface"]
+    depends_on:
+      backend: {condition: service_healthy}
+      rabbitmq: {condition: service_healthy}
+    restart: unless-stopped
 
   after-sales-worker:
     build:
@@ -97,5 +150,6 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  rabbitmq_data:
   minio_data:
   huggingface_cache:
