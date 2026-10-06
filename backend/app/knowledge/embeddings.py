@@ -9,6 +9,7 @@ from typing import Protocol
 from openai import AsyncOpenAI
 
 from backend.app.config import Settings
+from backend.app.security.circuit_breaker import CircuitBreaker, optional_guard
 
 
 class EmbeddingProvider(Protocol):
@@ -73,26 +74,28 @@ class HashEmbeddingProvider:
 
 
 class OpenAIEmbeddingProvider:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, breaker: CircuitBreaker | None = None) -> None:
         if not settings.embedding_api_key:
             raise RuntimeError("EMBEDDING_API_KEY is required when EMBEDDING_MODE=openai")
         self.name = settings.embedding_model
         self.dimensions = settings.embedding_dimensions
+        self.breaker = breaker
         self.client = AsyncOpenAI(
             api_key=settings.embedding_api_key,
             base_url=settings.embedding_base_url,
             timeout=settings.agent_timeout_seconds,
-            max_retries=2,
+            max_retries=0,
         )
 
     async def embed(
         self, texts: list[str], *, is_query: bool = False
     ) -> list[list[float]]:
-        response = await self.client.embeddings.create(
-            model=self.name,
-            input=texts,
-            dimensions=self.dimensions,
-        )
+        async with optional_guard(self.breaker):
+            response = await self.client.embeddings.create(
+                model=self.name,
+                input=texts,
+                dimensions=self.dimensions,
+            )
         vectors = [item.embedding for item in sorted(response.data, key=lambda item: item.index)]
         if len(vectors) != len(texts) or any(len(vector) != self.dimensions for vector in vectors):
             raise RuntimeError("Embedding provider returned an invalid shape")
@@ -132,7 +135,14 @@ class BgeSmallZhEmbeddingProvider:
                         return SentenceTransformer(self.name, device="cpu")
 
                 self._model = await asyncio.to_thread(load_model)
-                actual_dimensions = self._model.get_embedding_dimension()
+                dimension_getter = getattr(
+                    self._model,
+                    "get_embedding_dimension",
+                    None,
+                )
+                if dimension_getter is None:
+                    dimension_getter = self._model.get_sentence_embedding_dimension
+                actual_dimensions = dimension_getter()
                 if actual_dimensions != self.dimensions:
                     raise RuntimeError(
                         f"Embedding dimension mismatch: expected {self.dimensions}, "
@@ -166,11 +176,13 @@ class BgeSmallZhEmbeddingProvider:
         self._model = None
 
 
-def create_embedding_provider(settings: Settings) -> EmbeddingProvider:
+def create_embedding_provider(
+    settings: Settings, breaker: CircuitBreaker | None = None
+) -> EmbeddingProvider:
     if settings.embedding_dimensions != 512:
         raise ValueError("EMBEDDING_DIMENSIONS must be 512 for the current database schema")
     if settings.embedding_mode == "bge":
         return BgeSmallZhEmbeddingProvider(settings)
     if settings.embedding_mode == "openai":
-        return OpenAIEmbeddingProvider(settings)
+        return OpenAIEmbeddingProvider(settings, breaker)
     return HashEmbeddingProvider(settings.embedding_dimensions)

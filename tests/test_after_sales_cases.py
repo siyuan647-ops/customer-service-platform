@@ -36,6 +36,7 @@ def make_app(tmp_path):
     return create_app(
         Settings(
             app_env="test",
+            test_identity_header_enabled=True,
             database_url=f"sqlite+aiosqlite:///{tmp_path / 'after-sales-cases.db'}",
             event_backend="memory",
             minio_enabled=False,
@@ -226,7 +227,7 @@ def test_chat_confirmation_creates_one_case_from_verified_decision(tmp_path):
         updated_materials = client.patch(
             f"/after-sales/cases/{case_no}/materials",
             headers=headers,
-            json={"problem_type": "运输破损"},
+            json={"case_type": "refund", "problem_type": "运输破损"},
         )
         assert updated_materials.status_code == 200
 
@@ -250,10 +251,10 @@ def test_missing_materials_stages_case_and_exposes_material_panel_data(tmp_path)
             return AfterSalesResult(
                 decision="need_more_information",
                 reason_code="MATERIALS_REQUIRED",
-                reason="需要补充问题发生时间和商品问题凭证。",
+                reason="申请信息需要通过售后表单继续补充。",
                 required_information=[
-                    "商品问题的照片或视频证据",
-                    "问题发现的具体时间",
+                    "能够展示故障情况的影像",
+                    "故障情况说明",
                 ],
                 risk_level="low",
                 should_handoff=False,

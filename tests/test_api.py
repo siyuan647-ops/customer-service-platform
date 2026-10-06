@@ -14,6 +14,7 @@ def make_app(tmp_path):
     return create_app(
         Settings(
             app_env="test",
+            test_identity_header_enabled=True,
             database_url=f"sqlite+aiosqlite:///{tmp_path / 'test.db'}",
             event_backend="memory",
             minio_enabled=False,
@@ -117,7 +118,7 @@ def test_customer_identity_is_required_and_enforces_ownership(tmp_path):
             f"/conversations/{conversation_id}",
             headers={"X-Customer-ID": str(uuid.uuid4())},
         )
-    assert missing.status_code == 422
+    assert missing.status_code == 401
     assert created.status_code == 202
     assert forbidden.status_code == 403
 

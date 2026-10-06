@@ -16,6 +16,7 @@ from backend.app.models import (
     OutboxEvent,
 )
 from backend.app.orders.gateway import OrderGateway, OrderGatewayError
+from backend.app.security.circuit_breaker import CircuitOpenError
 from backend.app.storage import ObjectStorage
 
 
@@ -47,9 +48,30 @@ class EvidenceAnalysisService:
             return False
         try:
             await self._process_event(event_id)
+        except CircuitOpenError as exc:
+            await self._defer_open_circuit(event_id, exc.retry_after_seconds)
         except Exception as exc:
             await self._mark_event_failed(event_id, exc)
         return True
+
+    async def _defer_open_circuit(self, event_id: uuid.UUID, retry_after: int) -> None:
+        async with self.database.session_factory() as session:
+            event = await session.get(OutboxEvent, event_id, with_for_update=True)
+            if event is None:
+                return
+            event.status = "PENDING"
+            event.available_at = datetime.now(UTC) + timedelta(seconds=max(1, retry_after))
+            event.locked_at = None
+            event.attempt_count = max(0, event.attempt_count - 1)
+            event.last_error = "CircuitOpenError"
+            evidence = await session.get(
+                AfterSalesEvidence, uuid.UUID(str(event.payload["evidence_id"])),
+                with_for_update=True,
+            )
+            if evidence is not None:
+                evidence.analysis_status = "PENDING"
+                evidence.analysis_error = None
+            await session.commit()
 
     async def _claim_event(self) -> uuid.UUID | None:
         now = datetime.now(UTC)
@@ -163,7 +185,7 @@ class EvidenceAnalysisService:
             return None
         try:
             order = await self.orders.get_order(case.order_no, case.customer_id)
-        except OrderGatewayError:
+        except (OrderGatewayError, CircuitOpenError):
             return None
         if order is None:
             return None

@@ -33,6 +33,19 @@ def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+class CustomerAccount(Base):
+    __tablename__ = "customer_accounts"
+
+    customer_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    username: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(256), nullable=False)
+    is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
+    session_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, server_default=func.now(), nullable=False
+    )
+
+
 class Conversation(Base):
     __tablename__ = "conversations"
 
@@ -42,6 +55,7 @@ class Conversation(Base):
     )
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
     channel: Mapped[str] = mapped_column(String(32), default="web", nullable=False)
+    context_data: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, server_default=func.now(), nullable=False
     )
@@ -155,6 +169,7 @@ class CustomerOrder(Base):
     payment_status: Mapped[str] = mapped_column(String(32), nullable=False)
     amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     currency: Mapped[str] = mapped_column(String(3), default="CNY", nullable=False)
+    shipping_address: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
@@ -237,6 +252,63 @@ class Shipment(Base):
     order: Mapped[CustomerOrder] = relationship(back_populates="shipments")
 
 
+class CustomerServiceRequest(Base):
+    """Auditable customer-initiated order operation or invoice application."""
+
+    __tablename__ = "customer_service_requests"
+    __table_args__ = (
+        UniqueConstraint(
+            "customer_id",
+            "idempotency_key",
+            name="uq_customer_service_requests_customer_idempotency",
+        ),
+        Index(
+            "ix_customer_service_requests_customer_created",
+            "customer_id",
+            "created_at",
+        ),
+        Index(
+            "ix_customer_service_requests_order_type",
+            "order_no",
+            "request_type",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    request_no: Mapped[str] = mapped_column(String(40), unique=True, nullable=False)
+    conversation_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("conversations.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    customer_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), nullable=False, index=True
+    )
+    order_no: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    request_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="DRAFT")
+    request_payload: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    result_payload: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        server_default=func.now(),
+        onupdate=utc_now,
+        nullable=False,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class AfterSalesCase(Base):
     __tablename__ = "after_sales_cases"
     __table_args__ = (
@@ -278,7 +350,7 @@ class AfterSalesCase(Base):
     )
     order_no: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     order_item_no: Mapped[str] = mapped_column(String(48), nullable=False)
-    case_type: Mapped[str] = mapped_column(String(24), nullable=False)
+    case_type: Mapped[str | None] = mapped_column(String(24), nullable=True)
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     problem_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
     problem_description: Mapped[str | None] = mapped_column(Text, nullable=True)

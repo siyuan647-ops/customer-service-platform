@@ -1,6 +1,7 @@
 import json
 
-from kimi_agent_spike.safe_trace import SafeTrace, redact
+from backend.app.agents.tools import TraceRecorder
+from backend.app.trace_safety import redact
 
 
 def test_redact_nested_sensitive_values():
@@ -18,14 +19,14 @@ def test_redact_nested_sensitive_values():
     assert "buyer@example.com" not in serialized
 
 
-def test_trace_never_writes_raw_secret(tmp_path):
-    path = tmp_path / "trace.ndjson"
-    SafeTrace(path).emit(
+def test_trace_never_keeps_raw_secret():
+    recorder = TraceRecorder()
+    recorder.emit(
         "test",
         api_key="sk-secret-value-123456",
         order_id="ORD-20260918-001",
     )
-    content = path.read_text(encoding="utf-8")
+    content = json.dumps(recorder.events, ensure_ascii=False)
     assert "sk-secret-value" not in content
     assert "ORD-20260918-001" not in content
 

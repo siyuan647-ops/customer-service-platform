@@ -24,6 +24,7 @@ from backend.app.models import (
     OutboxEvent,
 )
 from backend.app.orders.gateway import OrderGateway, OrderGatewayError
+from backend.app.security.circuit_breaker import CircuitOpenError
 from backend.app.services.after_sales_cases import (
     AfterSalesCaseConflict,
     AfterSalesCaseNotFound,
@@ -33,7 +34,15 @@ from backend.app.services.after_sales_cases import (
 from backend.app.services.after_sales_rules import AfterSalesRuleEngine
 
 
-APPROVAL_ACTIONS = {"cancel_and_refund", "refund_only"}
+APPROVAL_ACTIONS = {
+    "cancel_and_refund",
+    "refund_only",
+    "return_and_refund",
+    "exchange",
+    "reship",
+    "repair",
+}
+REFUND_ACTIONS = {"cancel_and_refund", "refund_only", "return_and_refund"}
 
 
 class AfterSalesExecutionService:
@@ -129,7 +138,7 @@ class AfterSalesExecutionService:
         case_no: str,
         reviewer_id: str,
         action: str,
-        refund_amount: Decimal,
+        refund_amount: Decimal | None,
         reason: str,
     ) -> AfterSalesCase:
         action = action.strip().lower()
@@ -147,8 +156,13 @@ class AfterSalesExecutionService:
             raise AfterSalesDependencyError("订单系统暂时不可用") from exc
         if order is None:
             raise AfterSalesCaseNotFound("未找到售后申请对应的订单")
-        if refund_amount <= 0 or refund_amount > order.amount:
-            raise AfterSalesCaseValidationError("退款金额必须大于 0 且不能超过订单实付金额")
+        if action in REFUND_ACTIONS:
+            if refund_amount is None or refund_amount <= 0 or refund_amount > order.amount:
+                raise AfterSalesCaseValidationError(
+                    "退款金额必须大于 0 且不能超过订单实付金额"
+                )
+        else:
+            refund_amount = None
 
         state = AfterSalesRuleEngine.evaluate_order_state(order)
         if action == "cancel_and_refund":
@@ -156,7 +170,7 @@ class AfterSalesExecutionService:
                 raise AfterSalesCaseValidationError("当前订单状态不允许取消订单并退款")
         elif state is not None:
             raise AfterSalesCaseValidationError(
-                f"当前订单状态不允许执行签收后退款：{state.reason}"
+                f"当前订单状态不允许执行该售后动作：{state.reason}"
             )
 
         now = datetime.now(UTC)
@@ -299,9 +313,27 @@ class AfterSalesExecutionService:
             return False
         try:
             await self._process_event(event_id)
+        except CircuitOpenError as exc:
+            await self._defer_open_circuit(event_id, exc.retry_after_seconds)
         except Exception as exc:
             await self._mark_event_failed(event_id, exc)
         return True
+
+    async def _defer_open_circuit(self, event_id: uuid.UUID, retry_after: int) -> None:
+        async with self.database.session_factory() as session:
+            event = await session.get(OutboxEvent, event_id, with_for_update=True)
+            if event is None:
+                return
+            event.status = "PENDING"
+            event.available_at = datetime.now(UTC) + timedelta(seconds=max(1, retry_after))
+            event.locked_at = None
+            event.attempt_count = max(0, event.attempt_count - 1)
+            event.last_error = "CircuitOpenError"
+            case = await session.get(AfterSalesCase, event.aggregate_id, with_for_update=True)
+            if case is not None and case.status == "EXECUTING":
+                case.status = "APPROVED"
+                case.execution_started_at = None
+            await session.commit()
 
     async def _claim_event(self) -> uuid.UUID | None:
         now = datetime.now(UTC)
@@ -374,7 +406,7 @@ class AfterSalesExecutionService:
             customer_id = case.customer_id
             await session.commit()
 
-        if action is None or refund_amount is None:
+        if action is None:
             raise RuntimeError("Approved case is missing execution parameters")
         try:
             order = await self.orders.get_order(order_no, customer_id)
@@ -398,6 +430,27 @@ class AfterSalesExecutionService:
                 ),
             )
 
+        if action in {"return_and_refund", "exchange", "reship", "repair"}:
+            await self._run_operation(
+                case_id=case_id,
+                operation_type=f"create_{action}",
+                provider=self.oms.name,
+                idempotency_key=f"after-sales:{case_id}:{action}:v1",
+                request_payload={"order_id": order_no, "action": action},
+                call=lambda: self.oms.create_after_sales_fulfillment(
+                    order_no=order_no,
+                    action=action,
+                    idempotency_key=f"after-sales:{case_id}:{action}:v1",
+                ),
+            )
+            if action in {"exchange", "reship", "repair"}:
+                await self._set_case_status(
+                    case_id, "COMPLETED", "execution_completed"
+                )
+                return
+
+        if refund_amount is None:
+            raise RuntimeError("Refund action is missing refund amount")
         await self._set_case_status(case_id, "REFUND_PENDING", "refund_started")
         await self._run_operation(
             case_id=case_id,

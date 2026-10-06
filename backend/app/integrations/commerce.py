@@ -26,6 +26,18 @@ class OmsAdapter(Protocol):
         self, *, order_no: str, idempotency_key: str
     ) -> ExternalOperationResult: ...
 
+    async def update_shipping_address(
+        self, *, order_no: str, address: dict, idempotency_key: str
+    ) -> ExternalOperationResult: ...
+
+    async def remind_shipment(
+        self, *, order_no: str, idempotency_key: str
+    ) -> ExternalOperationResult: ...
+
+    async def create_after_sales_fulfillment(
+        self, *, order_no: str, action: str, idempotency_key: str
+    ) -> ExternalOperationResult: ...
+
 
 class PaymentAdapter(Protocol):
     name: str
@@ -36,6 +48,18 @@ class PaymentAdapter(Protocol):
         order_no: str,
         amount: Decimal,
         currency: str,
+        idempotency_key: str,
+    ) -> ExternalOperationResult: ...
+
+
+class InvoiceAdapter(Protocol):
+    name: str
+
+    async def issue_invoice(
+        self,
+        *,
+        order_no: str,
+        invoice_data: dict,
         idempotency_key: str,
     ) -> ExternalOperationResult: ...
 
@@ -75,6 +99,37 @@ class MockOmsAdapter:
             external_request_id=external_id,
             status="succeeded",
             payload={"order_id": order_no, "order_status": "cancelled"},
+        )
+
+    async def update_shipping_address(
+        self, *, order_no: str, address: dict, idempotency_key: str
+    ) -> ExternalOperationResult:
+        return ExternalOperationResult(
+            external_request_id=_external_id("MOCK-OMS-ADDRESS", idempotency_key),
+            status="succeeded",
+            payload={"order_id": order_no, "address": dict(address)},
+        )
+
+    async def remind_shipment(
+        self, *, order_no: str, idempotency_key: str
+    ) -> ExternalOperationResult:
+        return ExternalOperationResult(
+            external_request_id=_external_id("MOCK-OMS-REMIND", idempotency_key),
+            status="accepted",
+            payload={"order_id": order_no, "reminder_status": "accepted"},
+        )
+
+    async def create_after_sales_fulfillment(
+        self, *, order_no: str, action: str, idempotency_key: str
+    ) -> ExternalOperationResult:
+        if action not in {"return_and_refund", "exchange", "reship", "repair"}:
+            raise RuntimeError("Mock OMS does not support this after-sales action")
+        return ExternalOperationResult(
+            external_request_id=_external_id(
+                f"MOCK-OMS-{action.upper()}", idempotency_key
+            ),
+            status="succeeded",
+            payload={"order_id": order_no, "action": action, "status": "created"},
         )
 
 
@@ -117,5 +172,28 @@ class MockPaymentAdapter:
                 "payment_status": (
                     "refunded" if amount == order.amount else "partially_refunded"
                 ),
+            },
+        )
+
+
+class MockInvoiceAdapter:
+    name = "mock_invoice"
+
+    async def issue_invoice(
+        self,
+        *,
+        order_no: str,
+        invoice_data: dict,
+        idempotency_key: str,
+    ) -> ExternalOperationResult:
+        external_id = _external_id("MOCK-INVOICE", idempotency_key)
+        return ExternalOperationResult(
+            external_request_id=external_id,
+            status="issued",
+            payload={
+                "order_id": order_no,
+                "invoice_id": external_id,
+                "invoice_type": invoice_data["invoice_type"],
+                "download_url": f"https://example.invalid/invoices/{external_id}.pdf",
             },
         )

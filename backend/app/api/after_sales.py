@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, File, Header, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
+from backend.app.security.sessions import require_customer
 
 from backend.app.schemas import (
     AfterSalesCaseCreate,
@@ -35,7 +36,7 @@ def _raise_http(exc: Exception) -> None:
 async def create_case(
     payload: AfterSalesCaseCreate,
     request: Request,
-    customer_id: uuid.UUID = Header(alias="X-Customer-ID"),
+    customer_id: uuid.UUID = Depends(require_customer),
 ) -> AfterSalesCaseRead:
     try:
         case = await request.app.state.after_sales_cases.create_case(
@@ -61,7 +62,7 @@ async def create_case(
 async def list_cases(
     request: Request,
     conversation_id: uuid.UUID | None = None,
-    customer_id: uuid.UUID = Header(alias="X-Customer-ID"),
+    customer_id: uuid.UUID = Depends(require_customer),
 ) -> list[AfterSalesCaseRead]:
     cases = await request.app.state.after_sales_cases.list_cases(
         customer_id,
@@ -74,7 +75,7 @@ async def list_cases(
 async def get_case(
     case_no: str,
     request: Request,
-    customer_id: uuid.UUID = Header(alias="X-Customer-ID"),
+    customer_id: uuid.UUID = Depends(require_customer),
 ) -> AfterSalesCaseRead:
     try:
         case = await request.app.state.after_sales_cases.get_case(customer_id, case_no)
@@ -89,12 +90,13 @@ async def update_materials(
     case_no: str,
     payload: AfterSalesCaseMaterialUpdate,
     request: Request,
-    customer_id: uuid.UUID = Header(alias="X-Customer-ID"),
+    customer_id: uuid.UUID = Depends(require_customer),
 ) -> AfterSalesCaseRead:
     try:
         case = await request.app.state.after_sales_cases.update_materials(
             customer_id=customer_id,
             case_no=case_no,
+            case_type=payload.case_type,
             problem_type=payload.problem_type,
             problem_discovered_at=payload.problem_discovered_at,
             problem_description=payload.problem_description,
@@ -118,7 +120,7 @@ async def upload_evidence(
     case_no: str,
     request: Request,
     file: UploadFile = File(),
-    customer_id: uuid.UUID = Header(alias="X-Customer-ID"),
+    customer_id: uuid.UUID = Depends(require_customer),
 ) -> AfterSalesEvidenceRead:
     max_bytes = (
         request.app.state.settings.after_sales_video_upload_max_bytes
@@ -152,7 +154,7 @@ async def upload_evidence(
 async def submit_case(
     case_no: str,
     request: Request,
-    customer_id: uuid.UUID = Header(alias="X-Customer-ID"),
+    customer_id: uuid.UUID = Depends(require_customer),
 ) -> AfterSalesCaseRead:
     try:
         case = await request.app.state.after_sales_cases.submit_case(customer_id, case_no)

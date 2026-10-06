@@ -24,9 +24,11 @@ async def seed_demo_orders(database: Database) -> SeedResult:
     async with database.session_factory() as session:
         for data in DEMO_ORDERS:
             existing = await session.scalar(
-                select(CustomerOrder.id).where(CustomerOrder.order_no == data["order_id"])
+                select(CustomerOrder).where(CustomerOrder.order_no == data["order_id"])
             )
             if existing is not None:
+                if not existing.shipping_address:
+                    existing.shipping_address = data.get("shipping_address", {})
                 skipped += 1
                 continue
             order = CustomerOrder(
@@ -37,6 +39,7 @@ async def seed_demo_orders(database: Database) -> SeedResult:
                 payment_status=data["payment_status"],
                 amount=data["amount"],
                 currency=data["currency"],
+                shipping_address=data.get("shipping_address", {}),
                 created_at=data["created_at"],
                 paid_at=data["paid_at"],
             )

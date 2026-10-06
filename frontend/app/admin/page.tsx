@@ -119,7 +119,7 @@ export default function AdminPage() {
   const [token, setToken] = useState("");
   const [credentialsReady, setCredentialsReady] = useState(false);
   const [reviewerId, setReviewerId] = useState("demo-agent");
-  const [action, setAction] = useState<"" | "cancel_and_refund" | "refund_only">("");
+  const [action, setAction] = useState<"" | "cancel_and_refund" | "refund_only" | "return_and_refund" | "exchange" | "reship" | "repair">("");
   const [amount, setAmount] = useState("");
   const [reason, setReason] = useState("材料审核通过");
   const [busy, setBusy] = useState(false);
@@ -186,6 +186,7 @@ export default function AdminPage() {
       : "refund_only"
   );
   const effectiveAmount = amount || selected?.refund_amount || selected?.max_refund_amount || "";
+  const requiresRefundAmount = ["cancel_and_refund", "refund_only", "return_and_refund"].includes(effectiveAction);
 
   async function mutate(path: string, body?: object) {
     if (!selected || busy) return;
@@ -398,12 +399,16 @@ export default function AdminPage() {
                   <select value={effectiveAction} onChange={(event) => setAction(event.target.value as typeof action)}>
                     <option value="refund_only">仅退款</option>
                     <option value="cancel_and_refund">取消订单并退款</option>
+                    <option value="return_and_refund">退货退款</option>
+                    <option value="exchange">换货</option>
+                    <option value="reship">补发</option>
+                    <option value="repair">维修</option>
                   </select>
                 </label>
-                <label>
+                {requiresRefundAmount && <label>
                   <span>退款金额</span>
                   <input type="number" min="0.01" step="0.01" max={selected.max_refund_amount} value={effectiveAmount} onChange={(event) => setAmount(event.target.value)} />
-                </label>
+                </label>}
                 <label className="full">
                   <span>审核理由</span>
                   <textarea rows={3} value={reason} onChange={(event) => setReason(event.target.value)} />
@@ -414,7 +419,7 @@ export default function AdminPage() {
                 )}
                 {selected.status === "UNDER_REVIEW" && (
                   <>
-                    <button disabled={busy || !effectiveAmount || !reason.trim()} type="button" onClick={() => void mutate("approve", { action: effectiveAction, refund_amount: effectiveAmount, reason })}>审批通过并执行</button>
+                    <button disabled={busy || (requiresRefundAmount && !effectiveAmount) || !reason.trim()} type="button" onClick={() => void mutate("approve", { action: effectiveAction, refund_amount: requiresRefundAmount ? effectiveAmount : null, reason })}>审批通过并执行</button>
                     <button className="danger" disabled={busy || !reason.trim()} type="button" onClick={() => void mutate("reject", { reason })}>驳回申请</button>
                   </>
                 )}

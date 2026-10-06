@@ -4,6 +4,7 @@ from backend.app.agents.after_sales import AfterSalesAgent
 from backend.app.agents.contracts import (
     AfterSalesCaseFacts,
     AfterSalesResult,
+    CustomerOperationFacts,
     LogisticsFacts,
     OrderFacts,
     OrderItemFacts,
@@ -21,20 +22,6 @@ from backend.app.services.after_sales_rules import AfterSalesRuleEngine
 _CATEGORY_POLICY_SCOPE = {
     ProductCategory.FOOD_FRESH: ProductTag.FRESH.value,
 }
-
-_MATERIAL_COLLECTION_TERMS = (
-    "照片",
-    "图片",
-    "视频",
-    "凭证",
-    "举证",
-    "面单",
-    "外包装",
-    "发现时间",
-    "具体时间",
-    "问题时间",
-)
-
 
 class CustomerServiceWorkflow:
     def __init__(self, after_sales: AfterSalesAgent) -> None:
@@ -117,14 +104,6 @@ class CustomerServiceWorkflow:
         )
 
     @staticmethod
-    def _needs_material_form(decision: AfterSalesResult) -> bool:
-        """Return whether missing information can be collected by the material panel."""
-        if decision.decision != "need_more_information":
-            return False
-        requested = " ".join(decision.required_information)
-        return any(term in requested for term in _MATERIAL_COLLECTION_TERMS)
-
-    @staticmethod
     def _case_facts(case) -> AfterSalesCaseFacts:
         return AfterSalesCaseFacts(
             case_no=case.case_no,
@@ -137,6 +116,10 @@ class CustomerServiceWorkflow:
             evidence_deadline_at=case.evidence_deadline_at,
             deadline_status=case.deadline_status,
         )
+
+    @staticmethod
+    def _operation_facts(data: dict) -> CustomerOperationFacts:
+        return CustomerOperationFacts.model_validate(data)
 
     async def _finalize_after_sales(
         self,
@@ -166,9 +149,11 @@ class CustomerServiceWorkflow:
             validated = validated.model_copy(update={"should_handoff": True})
 
         case_facts = None
-        should_stage_case = validated.decision == "eligible" or self._needs_material_form(
-            validated
-        )
+        # Opening the material form is an intake action, not a refund approval.
+        # Once order/item/policy checks have passed, both an eligible result and
+        # user-supplied details still needed by the case can be collected there.
+        # Natural-language wording in required_information must not control flow.
+        should_stage_case = validated.decision in {"eligible", "need_more_information"}
         if should_stage_case and not validated.should_handoff:
             pending_case = await runtime.after_sales_cases.stage_decision(
                 conversation_id=runtime.conversation_id,
@@ -302,6 +287,76 @@ class CustomerServiceWorkflow:
                 logistics=LogisticsFacts.model_validate(result["data"]),
             )
 
+        if plan.intent == "address_change":
+            self._transition(runtime, "ADDRESS_CHANGE_FORM")
+            result = await runtime.execute(
+                "stage_address_change", {"order_id": plan.order_id}
+            )
+            return WorkflowResult(
+                status="success" if result["success"] else "error",
+                plan=plan,
+                customer_operation=(
+                    self._operation_facts(result["data"]) if result["success"] else None
+                ),
+                message=None if result["success"] else result["message"],
+            )
+
+        if plan.intent == "shipment_reminder":
+            self._transition(runtime, "SHIPMENT_REMINDER")
+            result = await runtime.execute(
+                "create_shipment_reminder", {"order_id": plan.order_id}
+            )
+            return WorkflowResult(
+                status="success" if result["success"] else "error",
+                plan=plan,
+                customer_operation=(
+                    self._operation_facts(result["data"]) if result["success"] else None
+                ),
+                message=None if result["success"] else result["message"],
+            )
+
+        if plan.intent == "invoice_apply":
+            self._transition(runtime, "INVOICE_FORM")
+            result = await runtime.execute(
+                "stage_invoice_application", {"order_id": plan.order_id}
+            )
+            return WorkflowResult(
+                status="success" if result["success"] else "error",
+                plan=plan,
+                customer_operation=(
+                    self._operation_facts(result["data"]) if result["success"] else None
+                ),
+                message=None if result["success"] else result["message"],
+            )
+
+        if plan.intent == "invoice_query":
+            self._transition(runtime, "INVOICE_LOOKUP")
+            result = await runtime.execute("get_invoice", {"order_id": plan.order_id})
+            return WorkflowResult(
+                status="success" if result["success"] else "not_found",
+                plan=plan,
+                customer_operation=(
+                    self._operation_facts(result["data"]) if result["success"] else None
+                ),
+                message=None if result["success"] else result["message"],
+            )
+
+        if plan.intent == "after_sales_status":
+            self._transition(runtime, "AFTER_SALES_STATUS_LOOKUP")
+            result = await runtime.execute(
+                "get_after_sales_status", {"order_id": plan.order_id}
+            )
+            return WorkflowResult(
+                status="success" if result["success"] else "not_found",
+                plan=plan,
+                after_sales_case=(
+                    AfterSalesCaseFacts.model_validate(result["data"])
+                    if result["success"]
+                    else None
+                ),
+                message=None if result["success"] else result["message"],
+            )
+
         if plan.intent == "policy_query":
             self._transition(runtime, "POLICY_RETRIEVAL")
             result = await runtime.execute(
@@ -356,6 +411,13 @@ class CustomerServiceWorkflow:
                 order=order,
                 required_information=[f"需要售后的商品：{choices}"],
             )
+
+        await runtime.conversation_context.set_active_order(
+            conversation_id=runtime.conversation_id,
+            customer_id=runtime.customer_id,
+            order_id=order.order_id,
+            order_item_id=order_item.item_id,
+        )
 
         warnings: list[str] = []
         if plan.product_category and plan.product_category != order_item.product_category:

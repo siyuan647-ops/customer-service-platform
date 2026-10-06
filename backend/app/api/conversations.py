@@ -5,7 +5,7 @@ import uuid
 from datetime import UTC, datetime
 
 import structlog
-from fastapi import APIRouter, Header, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from sqlalchemy import select
 from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 
@@ -14,6 +14,7 @@ from backend.app.messaging import AGENT_REPLY_REQUESTED
 from backend.app.models import AgentRun, Conversation, Message, OutboxEvent
 from backend.app.schemas import ConversationRead, MessageAccepted, MessageCreate, MessageRead
 from backend.app.services.conversations import list_messages, process_assistant_reply
+from backend.app.security.sessions import require_customer
 from backend.app.token_budget import estimate_text_tokens
 
 
@@ -30,7 +31,7 @@ async def create_message(
     conversation_id: uuid.UUID,
     payload: MessageCreate,
     request: Request,
-    customer_id: uuid.UUID = Header(alias="X-Customer-ID"),
+    customer_id: uuid.UUID = Depends(require_customer),
 ) -> MessageAccepted:
     try:
         content = validate_user_input(payload.content)
@@ -149,7 +150,7 @@ async def create_message(
 async def get_conversation(
     conversation_id: uuid.UUID,
     request: Request,
-    customer_id: uuid.UUID = Header(alias="X-Customer-ID"),
+    customer_id: uuid.UUID = Depends(require_customer),
 ) -> ConversationRead:
     database = request.app.state.database
     async with database.session_factory() as session:
@@ -173,16 +174,17 @@ async def get_conversation(
 async def stream_events(
     conversation_id: uuid.UUID,
     request: Request,
-    customer_id: uuid.UUID = Query(),
+    customer_id: uuid.UUID = Depends(require_customer),
     cursor: str | None = Query(default=None),
     last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
 ) -> EventSourceResponse:
     database = request.app.state.database
     async with database.session_factory() as session:
         conversation = await session.get(Conversation, conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
     if (
-        conversation is not None
-        and conversation.customer_id is not None
+        conversation.customer_id is not None
         and conversation.customer_id != customer_id
     ):
         raise HTTPException(status_code=403, detail="Conversation access denied")

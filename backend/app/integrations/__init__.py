@@ -1,3 +1,3 @@
-from .commerce import MockOmsAdapter, MockPaymentAdapter
+from .commerce import MockInvoiceAdapter, MockOmsAdapter, MockPaymentAdapter
 
-__all__ = ["MockOmsAdapter", "MockPaymentAdapter"]
+__all__ = ["MockInvoiceAdapter", "MockOmsAdapter", "MockPaymentAdapter"]

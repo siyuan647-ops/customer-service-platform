@@ -17,17 +17,21 @@ from backend.app.conversation_memory import create_conversation_memory
 from backend.app.database import Database
 from backend.app.events import create_event_broker
 from backend.app.knowledge.embeddings import create_embedding_provider
+from backend.app.knowledge.reranker import create_reranker
 from backend.app.knowledge.service import KnowledgeService
 from backend.app.logging import configure_logging
 from backend.app.messaging.locks import ConversationLeaseManager
 from backend.app.messaging.rabbitmq import AGENT_REPLY_REQUESTED, RabbitCommandBus
 from backend.app.models import AgentRun, Conversation
 from backend.app.orders import create_order_gateway
+from backend.app.integrations import MockInvoiceAdapter, MockOmsAdapter
+from backend.app.services.customer_operations import CustomerOperationService
 from backend.app.services.after_sales_cases import AfterSalesCaseService
 from backend.app.services.conversations import process_assistant_reply
 from backend.app.services.order import OrderService
 from backend.app.services.tickets import TicketService
 from backend.app.storage import ObjectStorage
+from backend.app.security.circuit_breaker import CircuitOpenError, RedisCircuitRegistry
 
 
 logger = structlog.get_logger()
@@ -129,6 +133,15 @@ class AgentReplyConsumer:
                         error_type="AgentReplyFailed",
                     )
                 await message.ack()
+            except CircuitOpenError:
+                try:
+                    await self.command_bus.publish_retry(
+                        payload, message_id=message_id, correlation_id=correlation_id,
+                        attempt=attempt, delay_tier=2,
+                    )
+                    await message.ack()
+                except Exception:
+                    await message.nack(requeue=True)
             except Exception as exc:
                 try:
                     if final_attempt:
@@ -182,6 +195,11 @@ async def run_worker() -> None:
     settings = get_settings()
     configure_logging(settings.log_level)
     database = Database(settings.database_url)
+    circuits = RedisCircuitRegistry(
+        settings.redis_url, threshold=settings.circuit_failure_threshold,
+        window_seconds=settings.circuit_window_seconds,
+        open_seconds=settings.circuit_open_seconds,
+    )
     broker = create_event_broker(settings.event_backend, settings.redis_url)
     memory = create_conversation_memory(
         settings.event_backend,
@@ -193,18 +211,27 @@ async def run_worker() -> None:
     knowledge = KnowledgeService(
         database=database,
         storage=storage,
-        embeddings=create_embedding_provider(settings),
+        embeddings=create_embedding_provider(settings, circuits.breaker("embedding")),
         settings=settings,
+        reranker=create_reranker(settings),
     )
-    order_gateway = create_order_gateway(settings, database)
+    order_gateway = create_order_gateway(settings, database, circuits.breaker("oms"))
+    customer_operations = CustomerOperationService(
+        database,
+        order_gateway,
+        MockOmsAdapter(database),
+        MockInvoiceAdapter(),
+    )
     responder = SupervisorAgent(
         settings,
         database,
         knowledge,
         OrderService(order_gateway),
         TicketService(database),
-        AfterSalesAgent(settings),
+        AfterSalesAgent(settings, circuits.breaker("model")),
         AfterSalesCaseService(database, order_gateway, storage, settings),
+        customer_operations=customer_operations,
+        model_breaker=circuits.breaker("model"),
     )
     leases = ConversationLeaseManager(
         settings.redis_url,
@@ -247,6 +274,7 @@ async def run_worker() -> None:
             await consumer.handle(message)
     finally:
         await command_bus.close()
+        await circuits.close()
         await leases.close()
         await memory.close()
         await broker.close()

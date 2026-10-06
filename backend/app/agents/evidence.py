@@ -8,6 +8,7 @@ from openai import AsyncOpenAI
 
 from backend.app.agents.contracts import EvidencePrecheckResult
 from backend.app.config import Settings
+from backend.app.security.circuit_breaker import CircuitBreaker, optional_guard
 
 
 def normalize_evidence_payload(payload: dict) -> dict:
@@ -27,8 +28,9 @@ def normalize_evidence_payload(payload: dict) -> dict:
 class EvidenceAnalyzer:
     """Produces advisory-only structured facts from customer evidence media."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, model_breaker: CircuitBreaker | None = None) -> None:
         self.settings = settings
+        self.model_breaker = model_breaker
 
     async def analyze(
         self,
@@ -78,10 +80,11 @@ class EvidenceAnalyzer:
             max_retries=0,
         )
         try:
-            async with asyncio.timeout(
-                self.settings.evidence_analysis_timeout_seconds
-            ):
-                response = await client.chat.completions.create(
+            async with optional_guard(self.model_breaker):
+                async with asyncio.timeout(
+                    self.settings.evidence_analysis_timeout_seconds
+                ):
+                    response = await client.chat.completions.create(
                     model=self.settings.kimi_model,
                     messages=[
                         {

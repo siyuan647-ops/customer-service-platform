@@ -22,6 +22,17 @@ class Settings(BaseSettings):
         "postgresql+asyncpg://customer_service:customer_service@localhost:5432/customer_service"
     )
     redis_url: str = "redis://localhost:6379/0"
+    session_ttl_seconds: int = Field(default=86_400, ge=300)
+    session_cookie_name: str = "cs_session"
+    trusted_proxy_cidrs: list[str] = Field(default_factory=list)
+    test_identity_header_enabled: bool = False
+    rate_limit_message_user: int = Field(default=10, ge=1)
+    rate_limit_message_ip: int = Field(default=60, ge=1)
+    rate_limit_evidence_user: int = Field(default=12, ge=1)
+    rate_limit_evidence_ip: int = Field(default=60, ge=1)
+    circuit_failure_threshold: int = Field(default=5, ge=1)
+    circuit_window_seconds: int = Field(default=30, ge=1)
+    circuit_open_seconds: int = Field(default=30, ge=1)
     event_backend: Literal["redis", "memory"] = "redis"
     agent_task_backend: Literal["inline", "rabbitmq"] = "inline"
     rabbitmq_url: str = "amqp://customer_service:customer_service@localhost:5672/"
@@ -81,7 +92,13 @@ class Settings(BaseSettings):
     knowledge_bm25_b: float = 0.75
     knowledge_rrf_k: int = 60
     knowledge_retrieval_candidates: int = 20
-    trace_path: str = "artifacts/safe-trace.ndjson"
+    reranker_enabled: bool = True
+    reranker_model: str = "BAAI/bge-reranker-large"
+    reranker_batch_size: int = Field(default=8, ge=1, le=64)
+    reranker_max_length: int = Field(default=512, ge=64, le=2048)
+    reranker_candidate_limit: int = Field(default=10, ge=1, le=50)
+    reranker_threshold: float = Field(default=0.04, ge=0, le=1)
+    reranker_warmup_on_startup: bool = True
     auto_create_schema: bool = False
 
 

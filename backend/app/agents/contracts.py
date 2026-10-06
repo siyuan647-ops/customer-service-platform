@@ -60,6 +60,23 @@ class CreateAfterSalesCaseArgs(BaseModel):
     confirmed: Literal[True]
 
 
+class StageOrderFormArgs(BaseModel):
+    order_id: str = Field(pattern=r"^ORD-\d{8}-\d{3}$")
+
+
+class CreateShipmentReminderArgs(BaseModel):
+    order_id: str = Field(pattern=r"^ORD-\d{8}-\d{3}$")
+
+
+class GetCustomerOperationArgs(BaseModel):
+    order_id: str = Field(pattern=r"^ORD-\d{8}-\d{3}$")
+
+
+class GetAfterSalesStatusArgs(BaseModel):
+    order_id: str | None = Field(default=None, pattern=r"^ORD-\d{8}-\d{3}$")
+    case_no: str | None = Field(default=None, min_length=4, max_length=40)
+
+
 class ToolResult(BaseModel):
     success: bool
     data: dict[str, Any] | None = None
@@ -72,6 +89,18 @@ class ConversationTurn(BaseModel):
     content: str = Field(min_length=1, max_length=8000)
 
 
+class ConversationContext(BaseModel):
+    """Durable references that must survive prompt-history trimming."""
+
+    active_order_id: str | None = Field(
+        default=None, pattern=r"^ORD-\d{8}-\d{3}$"
+    )
+    active_order_item_id: str | None = Field(
+        default=None, pattern=r"^ITEM-\d{8}-\d{3}-\d{2}$"
+    )
+    active_after_sales_case_no: str | None = None
+
+
 class SupervisorPlan(BaseModel):
     intent: Literal[
         "order_query",
@@ -79,6 +108,11 @@ class SupervisorPlan(BaseModel):
         "policy_query",
         "after_sales",
         "after_sales_confirm",
+        "address_change",
+        "shipment_reminder",
+        "invoice_apply",
+        "invoice_query",
+        "after_sales_status",
         "human_handoff",
         "general",
     ]
@@ -177,6 +211,29 @@ class PolicyDeadlineFacts(BaseModel):
     policy_references: list[PolicyReference] = Field(default_factory=list)
 
 
+AfterSalesReasonCode = Literal[
+    "QUALITY_OR_DAMAGE_CLAIM",
+    "POLICY_EVIDENCE_MISSING",
+    "MATERIALS_REQUIRED",
+    "CATEGORY_EXCLUDED_FROM_NO_REASON_RETURN",
+    "CLAIM_DETAILS_REQUIRED",
+    "AFTER_SALES_INTENT_UNCLEAR",
+    "POLICY_CONFLICT",
+    "CONFLICTING_POLICY",
+    "UNSUPPORTED_CASE_TYPE",
+    "UNVERIFIED_POLICY_REFERENCE",
+    "AFTER_SALES_CASE_EXISTS",
+    "ORDER_ALREADY_REFUNDED",
+    "ORDER_NOT_PAID",
+    "ORDER_CANCELLED_OR_CLOSED",
+    "PAYMENT_STATUS_REQUIRES_REVIEW",
+    "ORDER_NOT_SIGNED",
+    "PRE_SHIPMENT_REFUND_ALLOWED",
+    "ORDER_STATE_REQUIRES_REVIEW",
+    "EVIDENCE_DEADLINE_EXPIRED",
+]
+
+
 class AfterSalesResult(BaseModel):
     decision: Literal[
         "eligible",
@@ -184,25 +241,34 @@ class AfterSalesResult(BaseModel):
         "need_more_information",
         "policy_conflict",
     ]
-    reason_code: str = Field(min_length=2, max_length=64)
+    reason_code: AfterSalesReasonCode
     reason: str = Field(min_length=2, max_length=1000)
     required_information: list[str] = Field(default_factory=list)
     recommended_actions: list[str] = Field(default_factory=list)
     policy_references: list[PolicyReference] = Field(default_factory=list)
     risk_level: Literal["low", "medium", "high"] = "low"
     should_handoff: bool = False
+    case_type: Literal["refund", "return", "exchange", "reship", "repair"] | None = None
 
 
 class AfterSalesCaseFacts(BaseModel):
     case_no: str
     order_id: str
     order_item_id: str
-    case_type: Literal["refund", "return", "exchange", "reship", "repair"]
+    case_type: Literal["refund", "return", "exchange", "reship", "repair"] | None
     status: str
     evidence_required: bool
     problem_discovered_at_required: bool
     evidence_deadline_at: datetime | None = None
     deadline_status: str | None = None
+
+
+class CustomerOperationFacts(BaseModel):
+    request_no: str
+    order_id: str
+    request_type: Literal["address_change", "shipment_reminder", "invoice_application"]
+    status: str
+    result: dict[str, Any] = Field(default_factory=dict)
 
 
 class WorkflowResult(BaseModel):
@@ -221,6 +287,7 @@ class WorkflowResult(BaseModel):
     policy_deadline: PolicyDeadlineFacts | None = None
     after_sales: AfterSalesResult | None = None
     after_sales_case: AfterSalesCaseFacts | None = None
+    customer_operation: CustomerOperationFacts | None = None
     ticket_id: str | None = None
     required_information: list[str] = Field(default_factory=list)
     message: str | None = None

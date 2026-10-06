@@ -6,17 +6,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 COPY pyproject.toml ./
-RUN mkdir -p backend src/kimi_agent_spike && \
-    touch README.md backend/__init__.py src/kimi_agent_spike/__init__.py && \
+RUN mkdir -p backend && \
+    touch README.md backend/__init__.py && \
     pip install --upgrade pip && \
     pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.14.0+cpu" && \
     pip install .
 
 COPY backend ./backend
-COPY src ./src
 COPY README.md ./
 COPY migrations ./migrations
 COPY knowledge_docs ./knowledge_docs
+COPY evals ./evals
 COPY alembic.ini ./
 RUN pip install --no-deps --force-reinstall .
 

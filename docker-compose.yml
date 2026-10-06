@@ -71,9 +71,12 @@ services:
       AUTO_CREATE_SCHEMA: "false"
       API_CORS_ORIGINS: '["http://localhost:3000","http://127.0.0.1:3000"]'
       HF_HOME: /root/.cache/huggingface
+      RERANKER_ENABLED: ${RERANKER_ENABLED:-true}
+      RERANKER_MODEL: ${RERANKER_MODEL:-BAAI/bge-reranker-large}
+      RERANKER_THRESHOLD: ${RERANKER_THRESHOLD:-0.04}
     command: >-
       sh -c "alembic upgrade head &&
-      uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --no-access-log"
+        uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --no-access-log --no-proxy-headers"
     ports: ["8000:8000"]
     volumes: ["huggingface_cache:/root/.cache/huggingface"]
     healthcheck:
@@ -115,6 +118,9 @@ services:
       ORDER_BACKEND: postgres
       MINIO_ENDPOINT: minio:9000
       HF_HOME: /root/.cache/huggingface
+      RERANKER_ENABLED: ${RERANKER_ENABLED:-true}
+      RERANKER_MODEL: ${RERANKER_MODEL:-BAAI/bge-reranker-large}
+      RERANKER_THRESHOLD: ${RERANKER_THRESHOLD:-0.04}
     command: ["python", "-m", "backend.app.workers.agent_reply"]
     volumes: ["huggingface_cache:/root/.cache/huggingface"]
     depends_on:

@@ -23,6 +23,7 @@ from backend.app.orders.demo_data import DEMO_CUSTOMER_ID, SECONDARY_DEMO_CUSTOM
 from backend.app.orders.gateway import PostgresOrderGateway
 from backend.app.orders.seed import seed_demo_orders
 from backend.app.services.after_sales_execution import AfterSalesExecutionService
+from backend.app.security.circuit_breaker import CircuitOpenError
 
 
 ADMIN_HEADERS = {"X-Admin-Token": "test-admin", "X-Admin-ID": "agent-001"}
@@ -31,6 +32,7 @@ ADMIN_HEADERS = {"X-Admin-Token": "test-admin", "X-Admin-ID": "agent-001"}
 def _settings(path: Path) -> Settings:
     return Settings(
         app_env="test",
+        test_identity_header_enabled=True,
         database_url=f"sqlite+aiosqlite:///{path}",
         event_backend="memory",
         minio_enabled=False,
@@ -240,6 +242,64 @@ def test_signed_order_refund_only_executes_payment_without_oms_cancel(tmp_path):
     assert completed["operations"][0]["status"] == "SUCCEEDED"
 
 
+@pytest.mark.parametrize("action", ["exchange", "reship", "repair"])
+def test_non_refund_after_sales_actions_execute_through_mock_oms(tmp_path, action):
+    settings = _settings(tmp_path / f"{action}.db")
+    asyncio.run(_prepare(settings))
+    customer_headers = {"X-Customer-ID": DEMO_CUSTOMER_ID}
+
+    with TestClient(create_app(settings)) as client:
+        created = client.post(
+            "/after-sales/cases",
+            headers=customer_headers,
+            json={
+                "order_id": "ORD-20260926-004",
+                "order_item_id": "ITEM-20260926-004-01",
+                "case_type": action,
+                "reason": f"申请{action}",
+                "idempotency_key": f"execute-{action}-001",
+            },
+        )
+        case_no = created.json()["case_no"]
+        client.patch(
+            f"/after-sales/cases/{case_no}/materials",
+            headers=customer_headers,
+            json={"case_type": action, "problem_type": "功能故障"},
+        )
+        client.post(
+            f"/after-sales/cases/{case_no}/evidence",
+            headers=customer_headers,
+            files={"file": ("fault.png", b"\x89PNG\r\n\x1a\n", "image/png")},
+        )
+        client.post(f"/after-sales/cases/{case_no}/submit", headers=customer_headers)
+        client.post(
+            f"/admin/after-sales/cases/{case_no}/start-review",
+            headers=ADMIN_HEADERS,
+        )
+        approved = client.post(
+            f"/admin/after-sales/cases/{case_no}/approve",
+            headers=ADMIN_HEADERS,
+            json={
+                "action": action,
+                "refund_amount": None,
+                "reason": "材料审核通过",
+            },
+        )
+
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "APPROVED"
+    assert asyncio.run(_process_all(settings)) == 1
+
+    with TestClient(create_app(settings)) as client:
+        completed = client.get(
+            f"/admin/after-sales/cases/{case_no}", headers=ADMIN_HEADERS
+        ).json()
+    assert completed["status"] == "COMPLETED"
+    assert [item["operation_type"] for item in completed["operations"]] == [
+        f"create_{action}"
+    ]
+
+
 def test_database_rejects_two_active_cases_for_same_order_item(tmp_path):
     settings = _settings(tmp_path / "active-case-constraint.db")
     asyncio.run(_prepare(settings))
@@ -281,3 +341,67 @@ def test_database_rejects_two_active_cases_for_same_order_item(tmp_path):
             await database.dispose()
 
     asyncio.run(verify_constraint())
+
+
+def test_open_oms_circuit_defers_after_sales_without_spending_attempt(tmp_path):
+    settings = _settings(tmp_path / "deferred.db")
+    asyncio.run(_prepare(settings))
+    customer_headers = {"X-Customer-ID": SECONDARY_DEMO_CUSTOMER_ID}
+    with TestClient(create_app(settings)) as client:
+        created = client.post(
+            "/after-sales/cases", headers=customer_headers,
+            json={
+                "order_id": "ORD-20260918-002",
+                "order_item_id": "ITEM-20260918-002-01",
+                "case_type": "refund",
+                "reason": "订单未发货，需要取消",
+                "idempotency_key": "deferred-oms-001",
+            },
+        )
+        assert created.status_code == 201
+        case_no = created.json()["case_no"]
+        assert client.patch(
+            f"/after-sales/cases/{case_no}/materials", headers=customer_headers,
+            json={"problem_type": "未发货取消订单"},
+        ).status_code == 200
+        assert client.post(
+            f"/after-sales/cases/{case_no}/submit", headers=customer_headers
+        ).status_code == 200
+        assert client.post(
+            f"/admin/after-sales/cases/{case_no}/start-review", headers=ADMIN_HEADERS
+        ).status_code == 200
+        assert client.post(
+            f"/admin/after-sales/cases/{case_no}/approve", headers=ADMIN_HEADERS,
+            json={
+                "action": "cancel_and_refund", "refund_amount": "269.00",
+                "reason": "测试熔断延期",
+            },
+        ).status_code == 200
+
+    class OpenOms:
+        async def get_order(self, *_args):
+            raise CircuitOpenError("oms", 30)
+
+    async def verify():
+        database = Database(settings.database_url)
+        service = AfterSalesExecutionService(
+            database, OpenOms(), MockOmsAdapter(database), MockPaymentAdapter(database),
+            settings,
+        )
+        try:
+            assert await service.process_once() is True
+            async with database.session_factory() as session:
+                event = await session.scalar(select(OutboxEvent).where(
+                    OutboxEvent.event_type == "after_sales.execute"
+                ))
+                case = await session.scalar(select(AfterSalesCase).where(
+                    AfterSalesCase.case_no == case_no
+                ))
+            assert event is not None and event.status == "PENDING"
+            assert event.attempt_count == 0
+            assert event.available_at is not None
+            assert case is not None and case.status == "APPROVED"
+        finally:
+            await database.dispose()
+
+    asyncio.run(verify())

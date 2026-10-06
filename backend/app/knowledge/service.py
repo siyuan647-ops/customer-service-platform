@@ -16,6 +16,7 @@ from backend.app.storage import ObjectStorage
 from backend.app.knowledge.bm25 import bm25_scores
 from backend.app.knowledge.embeddings import EmbeddingProvider
 from backend.app.knowledge.parser import parse_document, split_document
+from backend.app.knowledge.reranker import Reranker
 
 
 class KnowledgeValidationError(ValueError):
@@ -47,17 +48,23 @@ class KnowledgeService:
         storage: ObjectStorage,
         embeddings: EmbeddingProvider,
         settings: Settings,
+        reranker: Reranker | None = None,
     ) -> None:
         self.database = database
         self.storage = storage
         self.embeddings = embeddings
         self.settings = settings
+        self.reranker = reranker
 
     async def close(self) -> None:
         await self.embeddings.close()
+        if self.reranker is not None:
+            await self.reranker.close()
 
     async def warmup(self) -> None:
         await self.embeddings.embed(["知识库检索模型预热"], is_query=True)
+        if self.reranker is not None and self.settings.reranker_warmup_on_startup:
+            await self.reranker.warmup()
 
     async def ping(self) -> bool:
         async with self.database.engine.connect() as connection:
@@ -205,7 +212,11 @@ class KnowledgeService:
         if len(query) < 2:
             raise KnowledgeValidationError("检索问题至少需要两个字符")
         query_vector = (await self.embeddings.embed([query], is_query=True))[0]
-        candidate_limit = max(top_k * 4, self.settings.knowledge_retrieval_candidates)
+        candidate_limit = max(
+            top_k * 4,
+            self.settings.knowledge_retrieval_candidates,
+            self.settings.reranker_candidate_limit if self.reranker is not None else 0,
+        )
 
         async with self.database.session_factory() as session:
             base_filter = []
@@ -335,7 +346,38 @@ class KnowledgeService:
                 item["bm25_score"],
             ),
             reverse=True,
-        )[:top_k]
+        )
+        if self.reranker is not None:
+            rerank_candidates = ranked[: self.settings.reranker_candidate_limit]
+            pairs = [
+                (
+                    query,
+                    "\n".join(
+                        (
+                            item["document"].title,
+                            item["chunk"].section,
+                            item["chunk"].content,
+                        )
+                    ),
+                )
+                for item in rerank_candidates
+            ]
+            rerank_scores = await self.reranker.score_pairs(pairs)
+            for item, score in zip(rerank_candidates, rerank_scores, strict=True):
+                item["rerank_score"] = score
+            ranked = sorted(
+                (
+                    item
+                    for item in rerank_candidates
+                    if item["rerank_score"] >= self.settings.reranker_threshold
+                ),
+                key=lambda item: (item["rerank_score"], item["rrf"]),
+                reverse=True,
+            )
+        else:
+            for item in ranked:
+                item["rerank_score"] = None
+        ranked = ranked[:top_k]
         return [self._serialize_result(item) for item in ranked]
 
     @staticmethod
@@ -354,6 +396,11 @@ class KnowledgeService:
             "bm25_score": round(float(item["bm25_score"]), 6),
             "vector_rank": item["vector_rank"],
             "bm25_rank": item["bm25_rank"],
+            "rerank_score": (
+                round(float(item["rerank_score"]), 6)
+                if item.get("rerank_score") is not None
+                else None
+            ),
             "citation": {
                 "source_filename": document.source_filename,
                 "title": document.title,

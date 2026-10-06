@@ -22,13 +22,34 @@ from backend.app.knowledge.service import KnowledgeService
 from backend.app.orchestration.workflow import CustomerServiceWorkflow
 from backend.app.services.order import OrderService
 from backend.app.services.after_sales_cases import AfterSalesCaseService
+from backend.app.services.conversation_context import ConversationContextService
+from backend.app.services.customer_operations import CustomerOperationService
 from backend.app.services.tickets import TicketService
+from backend.app.security.circuit_breaker import CircuitBreaker, optional_guard
 
 
 DeltaWriter = Callable[[str], Awaitable[None]]
 _ORDER_PATTERN = re.compile(r"ORD-\d{8}-\d{3}", re.IGNORECASE)
 _ORDER_ITEM_PATTERN = re.compile(r"ITEM-\d{8}-\d{3}-\d{2}", re.IGNORECASE)
-_AFTER_SALES_TERMS = ("退货", "退款", "换货", "补发", "保修", "破损", "损坏", "坏了", "变质", "质量")
+_AFTER_SALES_TERMS = (
+    "退货",
+    "退款",
+    "换货",
+    "补发",
+    "保修",
+    "维修",
+    "售后",
+    "破损",
+    "损坏",
+    "坏了",
+    "变质",
+    "质量",
+    "故障",
+    "缺件",
+    "少件",
+    "无法使用",
+    "不能正常使用",
+)
 _MOCK_PRODUCT_CATEGORIES: dict[ProductCategory, tuple[str, ...]] = {
     ProductCategory.FOOD_FRESH: ("食品生鲜", "生鲜食品", "生鲜"),
     ProductCategory.CLOTHING: ("服饰鞋包", "服饰", "衣服", "鞋", "袜子", "内衣"),
@@ -63,19 +84,25 @@ class SupervisorAgent:
     def __init__(
         self,
         settings: Settings,
-        database: Database,
+        database: Database | None,
         knowledge: KnowledgeService,
         orders: OrderService,
         tickets: TicketService,
         after_sales: AfterSalesAgent,
         after_sales_cases: AfterSalesCaseService,
+        conversation_context: ConversationContextService | None = None,
+        customer_operations: CustomerOperationService | None = None,
+        model_breaker: CircuitBreaker | None = None,
     ) -> None:
         self.settings = settings
+        self.model_breaker = model_breaker
         self.database = database
         self.knowledge = knowledge
         self.orders = orders
         self.tickets = tickets
         self.after_sales_cases = after_sales_cases
+        self.conversation_context = conversation_context or ConversationContextService(database)
+        self.customer_operations = customer_operations
         self.workflow = CustomerServiceWorkflow(after_sales)
 
     async def run(self, request: AgentRequest, on_delta: DeltaWriter) -> AgentOutcome:
@@ -100,10 +127,13 @@ class SupervisorAgent:
             orders=self.orders,
             tickets=self.tickets,
             after_sales_cases=self.after_sales_cases,
+            conversation_context=self.conversation_context,
+            customer_operations=self.customer_operations,
         )
         try:
             recorder.emit("supervisor_planning_started")
             plan = await self._plan(request)
+            plan = await self._apply_conversation_context(plan, request, recorder)
             recorder.emit("supervisor_plan_completed", plan=plan.model_dump(mode="json"))
             result = await self.workflow.execute(plan=plan, prompt=request.prompt, runtime=runtime)
             recorder.emit("workflow_completed", result=result.model_dump(mode="json"))
@@ -130,6 +160,52 @@ class SupervisorAgent:
             return self._plan_mock(request)
         plan = await self._plan_live(request)
         return self._normalize_plan(plan, request)
+
+    async def _apply_conversation_context(
+        self,
+        plan: SupervisorPlan,
+        request: AgentRequest,
+        recorder: TraceRecorder,
+    ) -> SupervisorPlan:
+        if plan.intent not in {
+            "order_query",
+            "logistics_query",
+            "after_sales",
+            "address_change",
+            "shipment_reminder",
+            "invoice_apply",
+            "invoice_query",
+            "after_sales_status",
+        }:
+            return plan
+        context = await self.conversation_context.get(
+            conversation_id=request.conversation_id,
+            customer_id=request.customer_id,
+        )
+        updates: dict[str, Any] = {}
+        if plan.order_id is None and context.active_order_id is not None:
+            updates["order_id"] = context.active_order_id
+            updates["missing_information"] = [
+                item for item in plan.missing_information if item != "订单号"
+            ]
+            if plan.order_item_id is None and context.active_order_item_id is not None:
+                updates["order_item_id"] = context.active_order_item_id
+            recorder.emit(
+                "conversation_context_applied",
+                fields=["active_order_id"],
+            )
+        elif (
+            plan.order_id is not None
+            and plan.order_id == context.active_order_id
+            and plan.order_item_id is None
+            and context.active_order_item_id is not None
+        ):
+            updates["order_item_id"] = context.active_order_item_id
+            recorder.emit(
+                "conversation_context_applied",
+                fields=["active_order_item_id"],
+            )
+        return plan.model_copy(update=updates) if updates else plan
 
     @staticmethod
     def _mock_product_category(prompt: str) -> ProductCategory | None:
@@ -182,9 +258,68 @@ class SupervisorAgent:
             intent = "after_sales_confirm"
         elif any(word in lowered for word in ("人工", "客服介入", "工单")):
             intent = "human_handoff"
-        elif any(word in lowered for word in ("物流", "快递", "到哪", "送达")) and not any(
-            word in lowered for word in ("政策", "规则")
+        elif (
+            "售后" in lowered
+            or any(
+                word in lowered
+                for word in (
+                    "退款申请",
+                    "换货申请",
+                    "补发申请",
+                    "维修申请",
+                    "退款",
+                    "换货",
+                    "补发",
+                    "维修",
+                )
+            )
+        ) and any(word in lowered for word in ("进度", "状态", "处理到哪", "结果")):
+            intent = "after_sales_status"
+        elif "地址" in lowered and any(
+            word in lowered
+            for word in (
+                "修改",
+                "更改",
+                "改成",
+                "换成",
+                "换一个",
+                "改一下",
+                "填错",
+                "错了",
+            )
         ):
+            intent = "address_change"
+        elif any(
+            word in lowered
+            for word in ("催发货", "催单", "尽快发货", "催一下", "催促", "提醒仓库")
+        ):
+            intent = "shipment_reminder"
+        elif any(word in lowered for word in ("发票", "开票")) and any(
+            word in lowered
+            for word in (
+                "查询",
+                "查一下",
+                "进度",
+                "状态",
+                "下载",
+                "开好",
+                "查看",
+                "显示",
+            )
+        ):
+            intent = "invoice_query"
+        elif any(word in lowered for word in ("发票", "开票")) and any(
+            word in lowered
+            for word in ("申请", "开票", "补开", "开发票", "要发票", "开具")
+        ):
+            intent = "invoice_apply"
+        elif (
+            any(
+                word in lowered
+                for word in ("物流", "快递", "配送", "包裹", "运单", "送达")
+            )
+            or ("到哪" in lowered and "订单处理" not in lowered)
+        ) and not any(word in lowered for word in ("政策", "规则")):
             intent = "logistics_query"
         elif any(word in lowered for word in _AFTER_SALES_TERMS) and (
             contextual_order_id
@@ -198,7 +333,16 @@ class SupervisorAgent:
         else:
             intent = "general"
 
-        requires_order = intent in {"order_query", "logistics_query", "after_sales"}
+        requires_order = intent in {
+            "order_query",
+            "logistics_query",
+            "after_sales",
+            "address_change",
+            "shipment_reminder",
+            "invoice_apply",
+            "invoice_query",
+            "after_sales_status",
+        }
         order_id = contextual_order_id if requires_order else None
         return SupervisorPlan(
             intent=intent,
@@ -226,7 +370,16 @@ class SupervisorAgent:
             history_text = "\n".join(turn.content for turn in request.history)
             if plan.order_id.casefold() in history_text.casefold():
                 order_id = plan.order_id.upper()
-        requires_order = plan.intent in {"order_query", "logistics_query", "after_sales"}
+        requires_order = plan.intent in {
+            "order_query",
+            "logistics_query",
+            "after_sales",
+            "address_change",
+            "shipment_reminder",
+            "invoice_apply",
+            "invoice_query",
+            "after_sales_status",
+        }
         item_match = _ORDER_ITEM_PATTERN.search(prompt)
         order_item_id = item_match.group(0).upper() if item_match else None
         if order_item_id is None and plan.order_item_id and _ORDER_ITEM_PATTERN.fullmatch(
@@ -276,6 +429,11 @@ class SupervisorAgent:
                 "policy_query",
                 "after_sales",
                 "after_sales_confirm",
+                "address_change",
+                "shipment_reminder",
+                "invoice_apply",
+                "invoice_query",
+                "after_sales_status",
                 "human_handoff",
                 "general",
             ],
@@ -326,7 +484,10 @@ class SupervisorAgent:
                 "订单/物流查询需要订单数据；具体订单的退款、退货、换货、补发、保修、"
                 "破损或质量判断属于 after_sales；只询问规则属于 policy_query；明确要求人工"
                 "属于 human_handoff。用户在上一轮获得可申请结论后明确回复确认提交，属于"
-                " after_sales_confirm。不得虚构订单号或商品分类。商品分类只能选择工具声明的"
+                " after_sales_confirm。修改收货地址属于 address_change；催发货属于"
+                " shipment_reminder；申请或补开发票属于 invoice_apply；查询发票属于"
+                " invoice_query；查询已有售后申请进度属于 after_sales_status。不得虚构"
+                "订单号或商品分类。商品分类只能选择工具声明的"
                 "候选值；product_category 无法确定时必须传 null。policy_category 只能选择"
                 "refund、shipping、after_sale、general；无法确定时必须传 general。订单商品项"
                 "编号只能来自对话；政策标签不确定时传空列表。missing_information 只允许"
@@ -350,8 +511,9 @@ class SupervisorAgent:
             ensure_ascii=False,
         )
         try:
-            async with asyncio.timeout(self.settings.agent_timeout_seconds):
-                await Runner.run(agent, input=payload, max_turns=2)
+            async with optional_guard(self.model_breaker):
+                async with asyncio.timeout(self.settings.agent_timeout_seconds):
+                    await Runner.run(agent, input=payload, max_turns=2)
             if not captured:
                 raise RuntimeError("Supervisor planner did not submit a plan")
             return captured[0]
@@ -371,9 +533,43 @@ class SupervisorAgent:
                     f"售后申请 {case.case_no} 正在等待材料，请在材料窗口填写问题类型，"
                     "并按提示上传照片或视频后提交。"
                 )
-            return f"售后申请已提交，申请单号：{case.case_no}。"
+            status_label = {
+                "DRAFT": "等待补充申请信息",
+                "SUBMITTED": "已提交，等待客服审核",
+                "UNDER_REVIEW": "人工审核中",
+                "APPROVED": "审核已通过，等待执行",
+                "EXECUTING": "正在执行售后处理",
+                "CANCEL_PENDING": "正在取消订单",
+                "REFUND_PENDING": "正在退款",
+                "COMPLETED": "已完成",
+                "REJECTED": "审核未通过",
+                "EXECUTION_FAILED": "执行失败，等待客服重试",
+            }.get(case.status, case.status)
+            return f"售后申请 {case.case_no} 当前进度：{status_label}。"
         if result.ticket_id and not result.after_sales:
             return f"已为你创建人工工单，工单号：{result.ticket_id}。客服会尽快处理。"
+        if result.customer_operation:
+            operation = result.customer_operation
+            if operation.request_type == "address_change":
+                return (
+                    f"订单 {operation.order_id} 可以申请修改收货地址，已创建申请"
+                    f" {operation.request_no}。请在地址表单填写并确认新地址。"
+                )
+            if operation.request_type == "shipment_reminder":
+                return (
+                    f"已为订单 {operation.order_id} 提交催发货请求"
+                    f"（{operation.request_no}），24小时内不会重复催单。"
+                )
+            if operation.status == "DRAFT":
+                return (
+                    f"已为订单 {operation.order_id} 创建发票申请"
+                    f" {operation.request_no}，请在发票表单填写开票信息。"
+                )
+            download_url = operation.result.get("download_url")
+            return (
+                f"订单 {operation.order_id} 的发票状态为 {operation.status}。"
+                + (f"下载地址：{download_url}" if download_url else "")
+            )
         if result.order:
             if result.after_sales:
                 return SupervisorAgent._compose_after_sales(result)
@@ -493,13 +689,14 @@ class SupervisorAgent:
         )
         chunks: list[str] = []
         try:
-            async with asyncio.timeout(self.settings.agent_timeout_seconds):
-                streamed = Runner.run_streamed(agent, input=payload, max_turns=self.settings.agent_max_turns)
-                async for event in streamed.stream_events():
-                    delta = _extract_text_delta(event)
-                    if delta:
-                        chunks.append(delta)
-                        await on_delta(delta)
+            async with optional_guard(self.model_breaker):
+                async with asyncio.timeout(self.settings.agent_timeout_seconds):
+                    streamed = Runner.run_streamed(agent, input=payload, max_turns=self.settings.agent_max_turns)
+                    async for event in streamed.stream_events():
+                        delta = _extract_text_delta(event)
+                        if delta:
+                            chunks.append(delta)
+                            await on_delta(delta)
             final = str(streamed.final_output or "")
             if not chunks and final:
                 await on_delta(final)

@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
-from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
 
@@ -43,6 +40,7 @@ def _fingerprint(value: Any) -> str:
 
 
 def redact(value: Any, *, key: str | None = None) -> Any:
+    """Redact secrets and customer identifiers before writing traces or reports."""
     if key and key.lower() in _SENSITIVE_KEYS:
         return _fingerprint(value)
     if isinstance(value, dict):
@@ -55,20 +53,3 @@ def redact(value: Any, *, key: str | None = None) -> Any:
             result = pattern.sub("<redacted>", result)
         return result
     return value
-
-
-class SafeTrace:
-    """A minimal local NDJSON trace that redacts secrets and customer identifiers."""
-
-    def __init__(self, path: Path):
-        self.path = path
-
-    def emit(self, event: str, **payload: Any) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        record = {
-            "timestamp": datetime.now(UTC).isoformat(),
-            "event": event,
-            **redact(payload),
-        }
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")

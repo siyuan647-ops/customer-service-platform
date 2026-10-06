@@ -4,6 +4,7 @@ import uuid
 from typing import Protocol
 
 import httpx
+from backend.app.security.circuit_breaker import CircuitBreaker, optional_guard
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
@@ -106,33 +107,32 @@ class PostgresOrderGateway:
 
 
 class HttpOmsGateway:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, breaker: CircuitBreaker | None = None) -> None:
         if not settings.order_oms_base_url:
             raise ValueError("ORDER_OMS_BASE_URL is required when ORDER_BACKEND=http")
         self.base_url = settings.order_oms_base_url.rstrip("/")
         self.api_key = settings.order_oms_api_key
         self.timeout = settings.order_oms_timeout_seconds
+        self.breaker = breaker
 
     async def get_order(self, order_id: str, customer_id: uuid.UUID) -> OrderFacts | None:
         headers = {"X-Customer-ID": str(customer_id)}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.get(
-                    f"{self.base_url}/orders/{order_id.strip().upper()}",
-                    headers=headers,
-                )
-        except httpx.HTTPError as exc:
-            raise OrderGatewayError("OMS request failed") from exc
-        if response.status_code in {403, 404}:
-            return None
-        try:
-            response.raise_for_status()
-            payload = response.json()
-            if not isinstance(payload, dict):
-                raise ValueError("OMS response must be a JSON object")
-            return OrderFacts.model_validate(payload.get("data", payload))
+            async with optional_guard(self.breaker):
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    response = await client.get(
+                        f"{self.base_url}/orders/{order_id.strip().upper()}",
+                        headers=headers,
+                    )
+                if response.status_code in {403, 404}:
+                    return None
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise ValueError("OMS response must be a JSON object")
+                return OrderFacts.model_validate(payload.get("data", payload))
         except (httpx.HTTPError, ValueError) as exc:
             raise OrderGatewayError("OMS returned an invalid response") from exc
 
@@ -143,9 +143,11 @@ class HttpOmsGateway:
         return None if order is None else order.shipments
 
 
-def create_order_gateway(settings: Settings, database: Database) -> OrderGateway:
+def create_order_gateway(
+    settings: Settings, database: Database, breaker: CircuitBreaker | None = None
+) -> OrderGateway:
     if settings.order_backend == "mock":
         return MockOrderGateway()
     if settings.order_backend == "http":
-        return HttpOmsGateway(settings)
+        return HttpOmsGateway(settings, breaker)
     return PostgresOrderGateway(database)

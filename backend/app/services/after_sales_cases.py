@@ -36,9 +36,6 @@ ALLOWED_EVIDENCE_CONTENT_TYPES = {
     "video/mp4",
     "video/quicktime",
 }
-_EVIDENCE_TERMS = ("照片", "图片", "视频", "凭证", "破损", "损坏", "变质", "少件", "质量")
-
-
 def _matches_content_type(data: bytes, content_type: str) -> bool:
     if content_type == "image/jpeg":
         return data.startswith(b"\xff\xd8\xff")
@@ -89,23 +86,6 @@ class AfterSalesCaseService:
         return f"AS-{datetime.now(UTC):%Y%m%d}-{uuid.uuid4().hex[:10].upper()}"
 
     @staticmethod
-    def _case_type_from_text(text: str) -> str:
-        if "换货" in text:
-            return "exchange"
-        if any(term in text for term in ("补发", "少件", "漏发")):
-            return "reship"
-        if any(term in text for term in ("保修", "维修")):
-            return "repair"
-        if "退货" in text and "退款" not in text:
-            return "return"
-        return "refund"
-
-    @staticmethod
-    def _needs_evidence(reason: str, required_information: list[str]) -> bool:
-        combined = " ".join([reason, *required_information])
-        return any(term in combined for term in _EVIDENCE_TERMS)
-
-    @staticmethod
     def _needs_problem_time(reason: str, required_information: list[str]) -> bool:
         # Deadline calculation uses the trusted order signing time. New cases do
         # not ask customers to provide a discovery time for that calculation.
@@ -123,6 +103,8 @@ class AfterSalesCaseService:
     @staticmethod
     def _missing_materials(case: AfterSalesCase) -> list[str]:
         missing: list[str] = []
+        if not case.case_type:
+            missing.append("希望的售后处理方式")
         if not case.problem_type:
             missing.append("问题类型")
         if case.evidence_required and not case.evidence:
@@ -191,7 +173,7 @@ class AfterSalesCaseService:
         customer_id: uuid.UUID,
         order_no: str,
         order_item_no: str,
-        case_type: str,
+        case_type: str | None,
         reason: str,
         idempotency_key: str,
         conversation_id: uuid.UUID | None = None,
@@ -208,7 +190,7 @@ class AfterSalesCaseService:
         deadline_window_hours: int | None = None,
         deadline_status: str | None = None,
         problem_time_required_override: bool | None = None,
-        evidence_required_override: bool | None = None,
+        evidence_required: bool = True,
         initial_status_override: str | None = None,
     ) -> AfterSalesCase:
         order_no = order_no.strip().upper()
@@ -231,6 +213,8 @@ class AfterSalesCaseService:
             decision = decision or state_decision.decision
             reason_code = reason_code or state_decision.reason_code
             decision_reason = decision_reason or state_decision.reason
+            if state_decision.reason_code == "PRE_SHIPMENT_REFUND_ALLOWED":
+                evidence_required = False
         elif deadline_window_hours is None or deadline_status is None:
             deadline = AfterSalesRuleEngine.evaluate_deadline(
                 order,
@@ -246,9 +230,6 @@ class AfterSalesCaseService:
                 )
 
         required = required_information or []
-        evidence_required = self._needs_evidence(reason, required)
-        if evidence_required_override is not None:
-            evidence_required = evidence_required_override
         problem_time_required = self._needs_problem_time(reason, required)
         if problem_time_required_override is not None:
             problem_time_required = problem_time_required_override
@@ -363,7 +344,7 @@ class AfterSalesCaseService:
             customer_id=customer_id,
             order_no=order.order_id,
             order_item_no=order_item.item_id,
-            case_type=self._case_type_from_text(reason),
+            case_type=decision.case_type,
             reason=reason,
             idempotency_key=f"agent-run:{run_id}",
             conversation_id=conversation_id,
@@ -385,11 +366,7 @@ class AfterSalesCaseService:
             problem_time_required_override=(
                 False if policy_deadline.status == "within_deadline" else None
             ),
-            evidence_required_override=(
-                False
-                if decision.reason_code == "PRE_SHIPMENT_REFUND_ALLOWED"
-                else None
-            ),
+            evidence_required=decision.reason_code != "PRE_SHIPMENT_REFUND_ALLOWED",
             initial_status_override="WAITING_MATERIALS",
         )
 
@@ -500,6 +477,23 @@ class AfterSalesCaseService:
                 raise AfterSalesCaseNotFound("未找到该售后申请")
             return case
 
+    async def get_latest_for_order(
+        self, customer_id: uuid.UUID, order_no: str
+    ) -> AfterSalesCase:
+        async with self.database.session_factory() as session:
+            case = await session.scalar(
+                self._query()
+                .where(
+                    AfterSalesCase.customer_id == customer_id,
+                    AfterSalesCase.order_no == order_no.strip().upper(),
+                )
+                .order_by(AfterSalesCase.created_at.desc())
+                .limit(1)
+            )
+            if case is None:
+                raise AfterSalesCaseNotFound("未找到该订单的售后申请")
+            return case
+
     async def add_evidence(
         self,
         *,
@@ -593,18 +587,28 @@ class AfterSalesCaseService:
         *,
         customer_id: uuid.UUID,
         case_no: str,
+        case_type: str | None,
         problem_type: str | None,
         problem_discovered_at: datetime | None,
         problem_description: str | None,
     ) -> AfterSalesCase:
         if (
-            problem_type is None
+            case_type is None
+            and problem_type is None
             and problem_discovered_at is None
             and problem_description is None
         ):
             raise AfterSalesCaseValidationError("没有可更新的材料信息")
         if problem_type is not None and not problem_type.strip():
             raise AfterSalesCaseValidationError("问题类型不能为空")
+        if case_type is not None and case_type not in {
+            "refund",
+            "return",
+            "exchange",
+            "reship",
+            "repair",
+        }:
+            raise AfterSalesCaseValidationError("不支持的售后处理方式")
         if problem_discovered_at is not None:
             if problem_discovered_at.tzinfo is None:
                 raise AfterSalesCaseValidationError("问题发现时间必须包含时区")
@@ -630,6 +634,8 @@ class AfterSalesCaseService:
                 raise AfterSalesCaseConflict("当前状态不能修改问题材料")
             if problem_type is not None:
                 case.problem_type = problem_type.strip()
+            if case_type is not None:
+                case.case_type = case_type
             if problem_discovered_at is not None:
                 case.problem_discovered_at = problem_discovered_at
             if problem_description is not None:
@@ -642,6 +648,7 @@ class AfterSalesCaseService:
                     actor_type="customer",
                     actor_id=str(customer_id),
                     action_metadata={
+                        "case_type_updated": case_type is not None,
                         "problem_type_updated": problem_type is not None,
                         "problem_discovered_at_updated": problem_discovered_at is not None,
                         "problem_description_updated": problem_description is not None,

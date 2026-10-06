@@ -27,6 +27,7 @@ def make_app(tmp_path):
     return create_app(
         Settings(
             app_env="test",
+            test_identity_header_enabled=True,
             database_url=f"sqlite+aiosqlite:///{tmp_path / 'knowledge.db'}",
             event_backend="memory",
             minio_enabled=False,
@@ -177,3 +178,46 @@ def test_supervisor_policy_tool_returns_source_citation(tmp_path):
     assert accepted.status_code == 202
     answer = conversation.json()["messages"][-1]["content"]
     assert "【来源：七天无理由退货规则.md，2. 特殊说明】" in answer
+
+
+class _FixedReranker:
+    name = "test-reranker"
+
+    def __init__(self, score: float) -> None:
+        self.score = score
+
+    async def score_pairs(self, pairs):
+        return [self.score if index == 0 else 0.0 for index, _ in enumerate(pairs)]
+
+    async def warmup(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+
+def test_reranker_threshold_returns_fewer_than_top_k_and_can_abstain(tmp_path):
+    with TestClient(make_app(tmp_path)) as client:
+        client.post(
+            "/knowledge/documents",
+            files={"file": ("policy.md", POLICY.encode(), "text/markdown")},
+        )
+        reranker = _FixedReranker(0.9)
+        client.app.state.knowledge.reranker = reranker
+        client.app.state.knowledge.settings.reranker_threshold = 0.5
+
+        accepted = client.post(
+            "/knowledge/search",
+            json={"query": "policy question", "top_k": 5},
+        )
+        reranker.score = 0.1
+        abstained = client.post(
+            "/knowledge/search",
+            json={"query": "unsupported question", "top_k": 5},
+        )
+
+    assert accepted.status_code == 200
+    assert len(accepted.json()["results"]) == 1
+    assert accepted.json()["results"][0]["rerank_score"] == 0.9
+    assert abstained.status_code == 200
+    assert abstained.json()["results"] == []

@@ -15,6 +15,7 @@ def make_app(database_path):
     return create_app(
         Settings(
             app_env="test",
+            test_identity_header_enabled=True,
             database_url=f"sqlite+aiosqlite:///{database_path}",
             event_backend="memory",
             minio_enabled=False,

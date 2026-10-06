@@ -13,6 +13,7 @@ from backend.app.agents.contracts import AgentRequest, ConversationTurn
 from backend.app.agents.supervisor import SupervisorAgent
 from backend.app.models import AgentRun, Conversation, Message
 from backend.app.token_budget import trim_history
+from backend.app.security.circuit_breaker import CircuitOpenError
 
 
 logger = structlog.get_logger()
@@ -175,15 +176,21 @@ async def process_assistant_reply(
             agent_run = await session.get(AgentRun, run_uuid, with_for_update=True)
             conversation = await session.get(Conversation, conversation_id)
             if agent_run:
-                agent_run.status = "failed" if final_attempt else "retrying"
+                agent_run.status = (
+                    "retrying" if isinstance(exc, CircuitOpenError) or not final_attempt else "failed"
+                )
                 agent_run.error_type = type(exc).__name__
                 agent_run.tool_call_count = getattr(exc, "tool_call_count", 0)
                 agent_run.trace = getattr(exc, "safe_trace", [])
-                agent_run.completed_at = datetime.now(UTC) if final_attempt else None
+                agent_run.completed_at = (
+                    datetime.now(UTC) if final_attempt and not isinstance(exc, CircuitOpenError) else None
+                )
             if conversation:
-                conversation.status = "active" if final_attempt else "processing"
+                conversation.status = (
+                    "processing" if isinstance(exc, CircuitOpenError) or not final_attempt else "active"
+                )
             await session.commit()
-        if final_attempt:
+        if final_attempt and not isinstance(exc, CircuitOpenError):
             await _safe_publish(
                 broker,
                 str(conversation_id),

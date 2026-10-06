@@ -37,12 +37,12 @@ dev = [
 ]
 
 [project.scripts]
-kimi-agent-spike = "kimi_agent_spike.cli:main"
 knowledge-import = "backend.app.knowledge.cli:main"
 order-seed = "backend.app.orders.seed:main"
+agent-eval = "backend.app.evaluation.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/kimi_agent_spike", "backend"]
+packages = ["backend"]
 
 [tool.pytest.ini_options]
 addopts = "-q"

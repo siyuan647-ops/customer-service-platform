@@ -11,8 +11,8 @@ from aio_pika.abc import AbstractRobustChannel, AbstractRobustConnection, Abstra
 from backend.app.config import Settings
 
 
-AGENT_REPLY_REQUESTED = "agent.reply.requested"
-AGENT_REPLY_DEAD = "dead.agent.reply.requested"
+AGENT_REPLY_REQUESTED = "agent.reply.requested"  #main router,request agent send message for users
+AGENT_REPLY_DEAD = "dead.agent.reply.requested"  #dead router,fails for many times
 AGENT_REPLY_RETRY_DELAYS_MS = (5_000, 30_000, 120_000)
 
 
@@ -21,9 +21,9 @@ class RabbitCommandBus:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.connection: AbstractRobustConnection | None = None
+        self.connection: AbstractRobustConnection | None = None  #tcp connection | application->RabbitMQ
         self.channel: AbstractRobustChannel | None = None
-        self.exchange: AbstractRobustExchange | None = None
+        self.exchange: AbstractRobustExchange | None = None  #entrace of message
         self.queue: aio_pika.abc.AbstractRobustQueue | None = None
 
     async def connect(self) -> None:
@@ -109,10 +109,14 @@ class RabbitCommandBus:
         message_id: str,
         correlation_id: str,
         attempt: int,
+        delay_tier: int | None = None,
     ) -> None:
         # ``attempt`` is the number of the next execution. Attempt 2 is the
         # first retry and therefore uses the first (5-second) delay tier.
-        retry_tier = min(max(attempt - 1, 1), len(AGENT_REPLY_RETRY_DELAYS_MS))
+        retry_tier = (
+            delay_tier if delay_tier is not None
+            else min(max(attempt - 1, 1), len(AGENT_REPLY_RETRY_DELAYS_MS))
+        )
         await self.publish(
             self.retry_routing_key(retry_tier),
             payload,

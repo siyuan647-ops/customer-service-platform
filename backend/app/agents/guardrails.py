@@ -15,6 +15,10 @@ _SECRET_REQUESTS = (
     "输出api key",
     "忽略之前的指令",
     "ignore previous instructions",
+    "reveal api key",
+    "print api key",
+    "jailbreak",
+    "越狱模式",
 )
 
 
@@ -28,4 +32,3 @@ def validate_user_input(value: str) -> str:
     if any(pattern in lowered for pattern in _SECRET_REQUESTS):
         raise UnsafeInputError("该请求涉及受保护的系统信息")
     return normalized
-

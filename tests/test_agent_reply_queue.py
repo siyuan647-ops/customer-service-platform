@@ -20,6 +20,7 @@ from backend.app.orders.demo_data import DEMO_CUSTOMER_ID
 def _settings(tmp_path, **overrides) -> Settings:
     values = {
         "app_env": "test",
+        "test_identity_header_enabled": True,
         "database_url": f"sqlite+aiosqlite:///{tmp_path / 'queue.db'}",
         "event_backend": "memory",
         "minio_enabled": False,

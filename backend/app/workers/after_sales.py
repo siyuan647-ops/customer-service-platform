@@ -14,6 +14,7 @@ from backend.app.orders import create_order_gateway
 from backend.app.services.after_sales_execution import AfterSalesExecutionService
 from backend.app.services.evidence_analysis import EvidenceAnalysisService
 from backend.app.storage import ObjectStorage
+from backend.app.security.circuit_breaker import RedisCircuitRegistry
 
 
 async def run_worker() -> None:
@@ -21,7 +22,12 @@ async def run_worker() -> None:
     configure_logging(settings.log_level)
     logger = structlog.get_logger()
     database = Database(settings.database_url)
-    orders = create_order_gateway(settings, database)
+    circuits = RedisCircuitRegistry(
+        settings.redis_url, threshold=settings.circuit_failure_threshold,
+        window_seconds=settings.circuit_window_seconds,
+        open_seconds=settings.circuit_open_seconds,
+    )
+    orders = create_order_gateway(settings, database, circuits.breaker("oms"))
     execution_service = AfterSalesExecutionService(
         database,
         orders,
@@ -34,7 +40,7 @@ async def run_worker() -> None:
         database,
         storage,
         orders,
-        EvidenceAnalyzer(settings),
+        EvidenceAnalyzer(settings, circuits.breaker("model")),
         settings,
     )
     stopping = asyncio.Event()
@@ -66,6 +72,7 @@ async def run_worker() -> None:
                 except TimeoutError:
                     pass
     finally:
+        await circuits.close()
         await database.dispose()
         logger.info("after_sales_worker_stopped")
 

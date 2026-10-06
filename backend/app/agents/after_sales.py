@@ -5,6 +5,7 @@ import json
 from typing import Literal
 
 from backend.app.agents.contracts import (
+    AfterSalesReasonCode,
     AfterSalesResult,
     OrderFacts,
     OrderItemFacts,
@@ -13,17 +14,32 @@ from backend.app.agents.contracts import (
     PolicyReference,
 )
 from backend.app.config import Settings
+from backend.app.security.circuit_breaker import CircuitBreaker, optional_guard
 
 
-_QUALITY_TERMS = ("破损", "损坏", "坏了", "变质", "质量", "故障", "少件", "缺件")
+_QUALITY_TERMS = (
+    "破损",
+    "损坏",
+    "坏了",
+    "变质",
+    "质量",
+    "故障",
+    "少件",
+    "缺件",
+    "缺失",
+    "无法正常使用",
+    "异常",
+    "充不了电",
+)
 _REFUND_TERMS = ("退款", "退货", "换货", "补发", "保修")
 
 
 class AfterSalesAgent:
     """Makes a typed after-sales decision from facts and retrieved evidence only."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, model_breaker: CircuitBreaker | None = None) -> None:
         self.settings = settings
+        self.model_breaker = model_breaker
 
     async def decide(
         self,
@@ -34,6 +50,15 @@ class AfterSalesAgent:
         evidence: list[PolicyEvidence],
         policy_deadline: PolicyDeadlineFacts | None = None,
     ) -> AfterSalesResult:
+        if not evidence:
+            return AfterSalesResult(
+                decision="need_more_information",
+                reason_code="POLICY_EVIDENCE_MISSING",
+                reason="没有检索到足以支持售后判断的政策证据。",
+                required_information=["适用的售后政策"],
+                risk_level="high",
+                should_handoff=True,
+            )
         if self.settings.agent_mode == "mock":
             return self._decide_mock(
                 user_request, order, order_item, evidence, policy_deadline
@@ -62,17 +87,21 @@ class AfterSalesAgent:
         evidence: list[PolicyEvidence],
         policy_deadline: PolicyDeadlineFacts | None,
     ) -> AfterSalesResult:
-        if not evidence:
-            return AfterSalesResult(
-                decision="need_more_information",
-                reason_code="POLICY_EVIDENCE_MISSING",
-                reason="没有检索到足以支持售后判断的政策证据。",
-                required_information=["适用的售后政策"],
-                risk_level="medium",
-                should_handoff=True,
-            )
-
         references = self._references(evidence)
+        if (
+            order_item.product_category == "食品生鲜"
+            and any(term in user_request for term in ("维修", "保修"))
+        ):
+            return AfterSalesResult(
+                decision="ineligible",
+                reason_code="UNSUPPORTED_CASE_TYPE",
+                reason="生鲜食品不具备维修可行性，可根据适用政策申请退款或补发。",
+                recommended_actions=["改为申请退款或补发"],
+                policy_references=references,
+                risk_level="low",
+                should_handoff=False,
+                case_type="repair",
+            )
         if any(term in user_request for term in _QUALITY_TERMS):
             return AfterSalesResult(
                 decision="eligible",
@@ -156,13 +185,17 @@ class AfterSalesAgent:
                 "need_more_information",
                 "policy_conflict",
             ],
-            reason_code: str,
+            reason_code: AfterSalesReasonCode,
             reason: str,
             required_information: list[str] | None = None,
             recommended_actions: list[str] | None = None,
             policy_reference_chunk_ids: list[str] | None = None,
             risk_level: Literal["low", "medium", "high"] = "low",
             should_handoff: bool = False,
+            case_type: Literal[
+                "refund", "return", "exchange", "reship", "repair"
+            ]
+            | None = None,
         ) -> str:
             """提交且仅提交一次结构化售后判定。"""
             references = [
@@ -185,6 +218,7 @@ class AfterSalesAgent:
                     policy_references=references,
                     risk_level=risk_level,
                     should_handoff=should_handoff,
+                    case_type=case_type,
                 )
             )
             return "售后判定已接收"
@@ -198,7 +232,18 @@ class AfterSalesAgent:
                 "eligible 或 ineligible 必须给出输入中存在的政策引用；证据不足时返回"
                 "need_more_information，政策互相冲突时返回 policy_conflict。引用政策时只"
                 "提交输入中的 chunk_id，不要复制或改写政策正文。policy_deadline 是后端"
-                "已经计算完成的可信事实，不得自行重新计算或用用户陈述覆盖。"
+                "已经计算完成的可信事实，不得自行重新计算或用用户陈述覆盖。case_type"
+                "只提取用户明确表达的诉求：退款 refund、退货 return、换货 exchange、"
+                "补发 reship、维修或保修 repair；无法确定时必须返回 null。"
+                "reason_code 必须使用工具声明中的固定候选值：符合质量、故障、破损类"
+                "退款、退货、换货、补发或保修申请时统一使用 QUALITY_OR_DAMAGE_CLAIM；"
+                "售后方式与商品天然不相容（例如生鲜食品申请维修）使用 "
+                "UNSUPPORTED_CASE_TYPE；政策冲突使用 POLICY_CONFLICT。"
+                "照片、视频、快递面单、包装照片、故障描述及是否人为损坏等材料，均由"
+                "案件创建后的材料表单和人工审核收集。用户尚未上传这些材料，不得因此"
+                "返回 need_more_information 或 ineligible；只要订单、申请类型、结构化"
+                "时效及政策已支持受理，就返回 eligible，并把待上传项目放入"
+                "required_information。不得把尚未举证等同于不符合资格。"
             ),
             model=model,
             model_settings=ModelSettings(
@@ -222,8 +267,9 @@ class AfterSalesAgent:
             ensure_ascii=False,
         )
         try:
-            async with asyncio.timeout(self.settings.agent_timeout_seconds):
-                await Runner.run(agent, input=payload, max_turns=2)
+            async with optional_guard(self.model_breaker):
+                async with asyncio.timeout(self.settings.agent_timeout_seconds):
+                    await Runner.run(agent, input=payload, max_turns=2)
             if not captured:
                 raise RuntimeError("After-sales agent did not submit a decision")
             return captured[0]

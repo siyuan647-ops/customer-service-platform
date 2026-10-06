@@ -94,6 +94,7 @@ class KnowledgeSearchResult(BaseModel):
     bm25_score: float
     vector_rank: int | None
     bm25_rank: int | None
+    rerank_score: float | None = None
     citation: KnowledgeCitation
 
 
@@ -111,6 +112,41 @@ class AfterSalesCaseCreate(BaseModel):
     case_type: AfterSalesCaseType
     reason: str = Field(min_length=4, max_length=1000)
     idempotency_key: str = Field(min_length=8, max_length=128)
+
+
+class CustomerServiceRequestRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    request_no: str
+    conversation_id: uuid.UUID | None
+    order_id: str = Field(validation_alias="order_no")
+    request_type: Literal["address_change", "shipment_reminder", "invoice_application"]
+    status: str
+    request_payload: dict
+    result_payload: dict
+    failure_reason: str | None
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None
+
+
+class ShippingAddressUpdate(BaseModel):
+    recipient: str = Field(min_length=2, max_length=50)
+    phone: str = Field(pattern=r"^1\d{10}$")
+    province: str = Field(min_length=2, max_length=50)
+    city: str = Field(min_length=2, max_length=50)
+    district: str = Field(min_length=2, max_length=50)
+    detail: str = Field(min_length=4, max_length=200)
+
+
+class InvoiceApplicationUpdate(BaseModel):
+    invoice_type: Literal["electronic_general", "vat_special"]
+    title_type: Literal["personal", "company"]
+    title: str = Field(min_length=2, max_length=100)
+    tax_number: str | None = Field(default=None, min_length=8, max_length=30)
+    email: str = Field(
+        pattern=r"^[^\s@]+@[^\s@]+\.[^\s@]+$",
+        max_length=254,
+    )
 
 
 class AfterSalesEvidenceRead(BaseModel):
@@ -133,6 +169,7 @@ class AdminAfterSalesEvidenceRead(AfterSalesEvidenceRead):
 
 
 class AfterSalesCaseMaterialUpdate(BaseModel):
+    case_type: AfterSalesCaseType | None = None
     problem_type: str | None = Field(default=None, min_length=2, max_length=100)
     problem_discovered_at: datetime | None = None
     problem_description: str | None = Field(default=None, min_length=2, max_length=1000)
@@ -184,7 +221,7 @@ class AfterSalesCaseRead(BaseModel):
     customer_id: uuid.UUID
     order_id: str = Field(validation_alias="order_no")
     order_item_id: str = Field(validation_alias="order_item_no")
-    case_type: AfterSalesCaseType
+    case_type: AfterSalesCaseType | None
     reason: str
     problem_type: str | None
     problem_description: str | None
@@ -222,8 +259,17 @@ class AfterSalesCaseRead(BaseModel):
 
 
 class AfterSalesApprovalRequest(BaseModel):
-    action: Literal["cancel_and_refund", "refund_only"]
-    refund_amount: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
+    action: Literal[
+        "cancel_and_refund",
+        "refund_only",
+        "return_and_refund",
+        "exchange",
+        "reship",
+        "repair",
+    ]
+    refund_amount: Decimal | None = Field(
+        default=None, gt=0, max_digits=12, decimal_places=2
+    )
     reason: str = Field(min_length=2, max_length=1000)
 
 

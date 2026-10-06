@@ -12,7 +12,7 @@ from backend.app.config import Settings
 from backend.app.database import Database
 from backend.app.models import CustomerOrder, OrderItem, Shipment
 from backend.app.orchestration.workflow import CustomerServiceWorkflow
-from backend.app.orders.demo_data import DEMO_CUSTOMER_ID
+from backend.app.orders.demo_data import DEMO_CUSTOMER_ID, DEMO_ORDERS
 from backend.app.orders.gateway import (
     MockOrderGateway,
     PostgresOrderGateway,
@@ -29,15 +29,19 @@ async def test_postgres_seed_is_idempotent_and_gateway_enforces_owner(tmp_path):
         first = await seed_demo_orders(database)
         second = await seed_demo_orders(database)
 
-        assert first.created == 6
+        assert first.created == len(DEMO_ORDERS)
         assert first.skipped == 0
         assert second.created == 0
-        assert second.skipped == 6
+        assert second.skipped == len(DEMO_ORDERS)
 
         async with database.session_factory() as session:
-            assert await session.scalar(select(func.count()).select_from(CustomerOrder)) == 6
-            assert await session.scalar(select(func.count()).select_from(OrderItem)) == 6
-            assert await session.scalar(select(func.count()).select_from(Shipment)) == 4
+            assert await session.scalar(select(func.count()).select_from(CustomerOrder)) == len(DEMO_ORDERS)
+            assert await session.scalar(select(func.count()).select_from(OrderItem)) == sum(
+                len(order["items"]) for order in DEMO_ORDERS
+            )
+            assert await session.scalar(select(func.count()).select_from(Shipment)) == sum(
+                len(order["shipments"]) for order in DEMO_ORDERS
+            )
 
         gateway = PostgresOrderGateway(database)
         order = await gateway.get_order(
@@ -58,9 +62,10 @@ async def test_postgres_seed_is_idempotent_and_gateway_enforces_owner(tmp_path):
         )
         assert recent is not None
         assert recent.items[0].product_category == ProductCategory.DIGITAL
-        assert recent.shipments[0].signed_at.replace(tzinfo=None) == datetime.fromisoformat(
-            "2026-09-26T15:30:00"
-        )
+        expected_signed_at = next(
+            item for item in DEMO_ORDERS if item["order_id"] == "ORD-20260926-004"
+        )["shipments"][0]["signed_at"]
+        assert recent.shipments[0].signed_at.replace(tzinfo=UTC) == expected_signed_at
 
         refund_test_order = await gateway.get_order(
             "ORD-20260926-005", uuid.UUID(DEMO_CUSTOMER_ID)
