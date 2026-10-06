@@ -1,0 +1,14 @@
+name: cslive20261006
+
+# Layer on top of docker-compose.yml. The main project's .env supplies only the
+# model credentials and endpoint; the isolated stack still uses separate data.
+services:
+  backend:
+    env_file: ../.env
+    environment:
+      AGENT_MODE: live
+
+  agent-worker:
+    env_file: ../.env
+    environment:
+      AGENT_MODE: live

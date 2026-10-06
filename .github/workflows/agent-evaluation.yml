@@ -1,0 +1,45 @@
+name: Agent evaluation
+
+on:
+  pull_request:
+    paths:
+      - "backend/app/agents/**"
+      - "backend/app/evaluation/**"
+      - "backend/app/orchestration/**"
+      - "backend/app/services/after_sales_rules.py"
+      - "knowledge_docs/**"
+      - "evals/**"
+      - "tests/test_evaluation_harness.py"
+      - "pyproject.toml"
+  push:
+    branches: [main]
+    paths:
+      - "backend/app/agents/**"
+      - "backend/app/evaluation/**"
+      - "backend/app/orchestration/**"
+      - "backend/app/services/after_sales_rules.py"
+      - "knowledge_docs/**"
+      - "evals/**"
+      - "tests/test_evaluation_harness.py"
+      - "pyproject.toml"
+  workflow_dispatch:
+
+jobs:
+  mock-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m pytest tests/test_evaluation_harness.py
+      - run: python -m backend.app.evaluation --mode mock
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-evaluation-report
+          path: artifacts/evaluation/
+          if-no-files-found: warn

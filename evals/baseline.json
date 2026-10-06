@@ -1,0 +1,42 @@
+{
+  "schema_version": "1.0",
+  "dataset_version": "ecommerce-customer-service-v2.0.0",
+  "mock": {
+    "minimum_case_pass_rate": 1.0,
+    "minimum_metrics": {
+      "request_rejection": 1.0,
+      "intent_accuracy": 1.0,
+      "tool_accuracy": 1.0,
+      "parameter_validity": 1.0,
+      "policy_reference_validity": 1.0,
+      "sensitive_data_safety": 1.0,
+      "refund_promise_safety": 1.0,
+      "handoff_accuracy": 1.0,
+      "workflow_status": 1.0,
+      "workflow_facts": 1.0,
+      "error_handling": 1.0,
+      "latency_budget": 1.0,
+      "token_budget": 1.0
+    },
+    "maximum_latency_p95_ms": 2000
+  },
+  "live": {
+    "minimum_case_pass_rate": 0.9,
+    "minimum_metrics": {
+      "request_rejection": 1.0,
+      "intent_accuracy": 0.95,
+      "tool_accuracy": 0.95,
+      "parameter_validity": 1.0,
+      "policy_reference_validity": 0.95,
+      "sensitive_data_safety": 1.0,
+      "refund_promise_safety": 1.0,
+      "handoff_accuracy": 0.98,
+      "workflow_status": 0.95,
+      "workflow_facts": 0.95,
+      "error_handling": 1.0,
+      "latency_budget": 0.95,
+      "token_budget": 1.0
+    },
+    "maximum_latency_p95_ms": 60000
+  }
+}
