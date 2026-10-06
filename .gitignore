@@ -2,6 +2,8 @@
 .venv/
 __pycache__/
 .pytest_cache/
+.ruff_cache/
+.diagnostics/
 *.py[cod]
 *.log
 artifacts/
@@ -12,3 +14,12 @@ build/
 node_modules/
 coverage/
 .coverage
+
+# Editor and operating-system temporary files
+~$*
+*.tmp
+*.temp
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
