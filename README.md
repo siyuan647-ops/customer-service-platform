@@ -1,34 +1,37 @@
 # 多角色电商智能客服平台
 
-第4阶段已在 PostgreSQL + pgvector 政策知识库之上加入多角色编排：Supervisor Agent 负责结构化计划和最终话术，After-sales Agent 负责售后判定，Order、Knowledge、Ticket 保持为确定性领域服务。政策按“同名文件唯一当前版本”管理：重复内容幂等跳过，内容变化时原位替换分块。
+这是一个可在本地运行的电商智能客服演示项目，覆盖订单与物流查询、政策问答、售后申请、人工审核和模拟执行。Supervisor Agent 负责结构化计划与最终话术，After-sales Agent 负责售后判定；订单、知识检索和工单由受控领域服务处理。政策按“同名文件唯一当前版本”管理：重复内容幂等跳过，内容变化时原位替换分块。模型可运行在 Mock 模式，真实商城操作和支付退款目前仍使用 Mock 适配器。
 
 ## 架构
 
 ```text
-Next.js chat UI
-  ├─ POST /conversations/{id}/messages
-  └─ SSE  /conversations/{id}/events
-                     │
-                  FastAPI
-          ┌──────────┼──────────┐
-      PostgreSQL       Redis          MinIO
-       完整消息    短期上下文/SSE事件    文件
-                     │
-              Supervisor Agent
-          结构化计划 / 最终话术
-                     │
-               轻量状态机
-       ┌─────────────┼─────────────┐
-  OrderService  KnowledgeService  TicketService
-       └─────────────┬─────────────┘
-                     │（售后场景）
-             After-sales Agent
-                结构化判定
-                     │
-             引用与结果确定性校验
+Next.js 对话页 / 人工工作台
+           │ HTTP + SSE
+           ▼
+FastAPI（登录鉴权、输入检查、消息持久化）
+           │
+           ├── PostgreSQL：消息、AgentRun、Outbox、业务数据
+           ├── Redis：Session、短期上下文、SSE 事件
+           └── MinIO：政策文件与售后凭证
+           │
+           ▼
+Outbox Relay → RabbitMQ → Agent Worker
+                            │
+                            ▼
+                 Supervisor Agent / 轻量状态机
+                            │
+             ┌──────────────┼──────────────┐
+         订单服务         知识检索服务         工单服务
+                            │（售后场景）
+                       After-sales Agent
+                            │
+                    引用与业务结果校验
+
+售后凭证上传 → Outbox → 售后 Worker → 多模态预审
+人工审批 → Outbox → 售后 Worker → Mock OMS / Payment
 ```
 
-POST接口先持久化用户消息并返回 `202 Accepted`。后台任务生成回复并依次发布：
+Docker Compose 使用 RabbitMQ 模式：消息接口先把用户消息、AgentRun 和 Outbox 命令写入 PostgreSQL，再返回 `202 Accepted`；Relay 将命令发布到 RabbitMQ，由独立 Worker 生成回复。本地开发也支持 `AGENT_TASK_BACKEND=inline`，此模式在请求内执行 Agent，仍返回 `202` 状态码，但请求会等待处理完成。处理过程发布以下 SSE 事件：
 
 - `user_message.created`
 - `assistant.started`
@@ -61,7 +64,7 @@ AGENT_CURRENT_MESSAGE_MAX_TOKENS=4096
 真实模型与真实知识检索使用 `--mode live`；仅验证真实模型、保持确定性知识夹具时使用
 `--mode live-fixture`。
 
-命令校验意图、工具及参数、政策引用、结构化业务事实、敏感信息、退款承诺、人工转交、时延和 Token 预算，并在质量门禁失败时返回非零退出码。报告写入 `artifacts/evaluation/latest.json` 与 `latest.md`；完整使用方法见 [自动化评测说明](docs/evaluation-harness.md)。GitHub Actions 会在 Prompt、Agent、工具、状态机、售后规则、知识库或评测基线变化时自动跑全量 Mock 回归。
+命令校验意图、工具及参数、政策引用、结构化业务事实、敏感信息、退款承诺、人工转交、时延和 Token 预算，并在质量门禁失败时返回非零退出码。报告写入 `artifacts/evaluation/latest.json` 与 `latest.md`；完整使用方法见 [自动化评测说明](docs/evaluation-harness.md)。现有 GitHub Actions 仅在工作流列出的路径发生变化时运行 Mock 回归；它不执行真实模型评测，也不能用 Mock 通过率代表真实客服回答准确率。
 
 当前 Agent 标准链路为：
 
@@ -108,7 +111,7 @@ Supervisor 现支持 `address_change`、`shipment_reminder`、`invoice_apply`、
 docker compose exec backend python -m backend.app.orders.seed
 ```
 
-重复执行只会报告 `skipped`，不会创建重复订单。
+重复执行只会报告 `skipped`，不会创建重复订单，也不会刷新已有订单的时间。演示订单的签收时间相对首次导入时刻生成；运行一段时间后，原本用于 2/48 小时举证窗口演示的订单会自然过期。需要重新演示时，应使用全新的演示数据库或新订单，不要对已有业务数据运行删除操作。
 
 ## 政策知识库
 
@@ -153,7 +156,7 @@ RERANKER_THRESHOLD=0.04
 RAG 参数基线与 reranker 阈值可重复评测：
 
 ```powershell
-$artifactDir = (Resolve-Path .\artifacts).Path
+$artifactDir = (New-Item -ItemType Directory -Force -Path .\artifacts).FullName
 docker compose run --rm --no-deps -v "${artifactDir}:/app/artifacts" backend python -m backend.app.rag_evaluation --report-dir /app/artifacts/rag-evaluation
 docker compose run --rm --no-deps -v "${artifactDir}:/app/artifacts" backend python -m backend.app.rag_evaluation.reranker_cli --report-dir /app/artifacts/rag-evaluation
 ```
@@ -242,26 +245,31 @@ EVIDENCE_ANALYSIS_PROMPT_VERSION=evidence-precheck-v1
 
 ## 快速启动
 
-1. 从模板创建本地配置：
+需要 Docker Compose；以下命令在项目根目录运行，首次构建和加载本地 BGE 模型需要下载依赖。
+
+1. 尚无 `.env` 时，从模板创建本地配置。示例已设置 `AGENT_MODE=mock`，不会调用付费模型；已有 `.env` 则先核对其中的 `AGENT_MODE`：
 
 ```powershell
-Copy-Item .env.example .env
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 ```
 
-2. 默认保持 `AGENT_MODE=mock`，避免开发期间产生模型费用。如需调用Kimi，将其改为 `live` 并只在 `.env` 中填写密钥。
+2. 如需调用 Kimi，在本地 `.env` 中设置 `AGENT_MODE=live` 和 `KIMI_API_KEY`；保持 `mock` 可先验证页面和业务流程。
 
 3. 启动完整环境：
 
 ```powershell
-docker compose up --build
+docker compose up -d --build --wait
 ```
 
-4. 首次启动后导入政策与演示订单：
+4. 首次启动后导入政策与演示订单，并为演示客户创建登录账号。最后一条命令会交互式读取至少 12 位密码：
 
 ```powershell
 docker compose exec backend python -m backend.app.knowledge.cli /app/knowledge_docs
 docker compose exec backend python -m backend.app.orders.seed
+docker compose exec backend python -m backend.app.security.provision demo 00000000-0000-4000-8000-000000000001
 ```
+
+打开 `http://localhost:3000`，用 `demo` 和刚设置的密码登录。可以先询问“订单 ORD-20260918-001 的物流到哪了？”或“七天无理由退货规则是什么？”。重复执行账号创建命令会重置密码并使旧 Session 失效。导入过的演示订单不会刷新签收时间，时效类案例会随时间过期。
 
 服务地址：
 
@@ -275,6 +283,8 @@ docker compose exec backend python -m backend.app.orders.seed
 
 对话接口同时保留 `/api/v1` 前缀别名，供当前前端与后续版本化客户端使用。容器内仍使用 PostgreSQL `5432` 和 Redis `6379`。
 
+当前前端会访问同一主机的 `8000` 端口，以上步骤面向本机演示。若使用域名、HTTPS 或反向代理部署，需要先调整前端 API 地址与代理、CORS、Cookie 配置；这份 Compose 配置不提供完整的生产部署方案。
+
 > MinIO 上游社区镜像已于 2026 年 9 月撤下。本项目为本地开发固定使用 `bitnamilegacy/minio:2025.7.23-debian-12-r5`；生产部署前应重新评估受维护的 S3 兼容存储或商业镜像。
 
 ## 本地开发
@@ -282,6 +292,8 @@ docker compose exec backend python -m backend.app.orders.seed
 项目目标运行时为 Python 3.12。后端安装与运行：
 
 ```powershell
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+docker compose up -d postgres redis minio
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev]"
@@ -289,7 +301,7 @@ alembic upgrade head
 uvicorn backend.app.main:app --reload --port 8000
 ```
 
-模板中的数据库和 Redis 地址已经使用宿主机端口 `15432`、`16379`，因此后端也可以直接在宿主机运行。
+模板中的数据库、Redis 和 MinIO 地址使用宿主机端口，因此后端可以直接在宿主机运行；默认 `AGENT_TASK_BACKEND=inline`，不需要单独启动 RabbitMQ Agent Worker。如果已有 `.env`，应核对其中的连接地址与 `AGENT_MODE`。完整的异步队列、售后执行与预审链路请使用上面的 Docker Compose 快速启动。
 
 前端：
 
@@ -308,7 +320,7 @@ npm run lint
 npm run build
 ```
 
-测试使用 SQLite、内存事件Broker和Mock Agent，不依赖外部服务，也不会调用真实模型。
+默认测试使用 SQLite、内存事件 Broker 和 Mock Agent，不依赖外部服务，也不会调用真实模型。Redis 集成测试仅在设置隔离的 `REDIS_TEST_URL` 时运行，否则跳过。
 
 ## 数据库迁移
 
@@ -351,18 +363,25 @@ alembic downgrade -1
 ```text
 backend/app/           FastAPI应用
   agents/              Supervisor、工具契约、运行时与输入检查
-  api/                 健康检查、会话和SSE路由
-  knowledge/           文档解析、向量生成、导入与混合召回
-  services/            Agent与会话处理服务
-frontend/              Next.js对话页面
+  api/                 登录、会话、售后、知识库与SSE接口
+  knowledge/           文档解析、向量生成、混合召回与重排
+  messaging/           Outbox 与 RabbitMQ 命令
+  security/            Session、限流与熔断
+  services/            业务领域服务
+  workers/             Agent 回复与售后执行 Worker
+  evaluation/          Agent 回归评测
+  rag_evaluation/      知识检索评测
+frontend/              Next.js对话页面与人工工作台
 migrations/            Alembic迁移
 tests/                 后端单元与集成测试
-docs/                  阶段报告
+docs/                  评测、队列与项目说明
+knowledge_docs/        演示政策文档
+loadtests/             负载测试脚本
 ```
 
 ## 安全
 
-- `.env`、Trace、构建产物和依赖目录均已忽略。
+- `.env`、本地评测产物、构建产物和依赖目录均已通过 Git 忽略；脱敏 Agent Trace 存储在数据库中。
 - `.dockerignore` 阻止本地密钥进入Docker构建上下文。
-- `.env.example` 只能包含占位值，不得写入真实密钥。
-- 默认使用Mock Agent；生产环境显式设置 `AGENT_MODE=live`。
+- `.env.example` 包含本地开发用的固定数据库、RabbitMQ 和 MinIO 口令，以及外部 API 的空值或占位值；不得写入真实密钥。对外部署前必须更换这些固定口令并配置管理员 Token。
+- 默认使用 Mock Agent；需要真实模型时显式设置 `AGENT_MODE=live` 和 `KIMI_API_KEY`。OMS、支付和发票适配器目前仍为 Mock。

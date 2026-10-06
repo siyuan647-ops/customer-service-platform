@@ -23,3 +23,9 @@ coverage/
 *.swo
 .DS_Store
 Thumbs.db
+
+# Local planning and interview materials
+PRD.md
+Plan.md
+update_log.md
+docs/*.docx
